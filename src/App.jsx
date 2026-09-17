@@ -165,7 +165,8 @@ export default function App() {
   const [teamA, setTeamA] = useState([]);
   const [teamB, setTeamB] = useState([]);
   const [selSwap, setSelSwap] = useState(null);
-  const [diffInput, setDiffInput] = useState("");
+  const [winner, setWinner] = useState(null); // "A" | "draw" | "B"
+  const [marginInput, setMarginInput] = useState("");
   const [mvpOff, setMvpOff] = useState("");
   const [mvpDef, setMvpDef] = useState("");
   const [showHistory, setShowHistory] = useState(false);
@@ -175,6 +176,8 @@ export default function App() {
   const [manualSmall, setManualSmall] = useState(2);
   const [manualMedium, setManualMedium] = useState(5);
   const [expandedPlayerId, setExpandedPlayerId] = useState(null);
+  const [tab, setTab] = useState("seance"); // "seance" | "classement"
+  const [sortKey, setSortKey] = useState("overall"); // "off" | "def" | "overall"
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -320,7 +323,8 @@ export default function App() {
     setOptIdx(0);
     setTeamA(opts[0].teamA);
     setTeamB(opts[0].teamB);
-    setDiffInput("");
+    setWinner(null);
+    setMarginInput("");
     setMvpOff("");
     setMvpDef("");
   };
@@ -360,9 +364,13 @@ export default function App() {
       : autoTh || { ...DEFAULT_THRESHOLDS, n: 0 };
 
   const saveResult = () => {
-    const diff = Number(diffInput);
-    if (!Number.isFinite(diff) || diffInput.trim() === "") {
-      setError("Entre une différence de buts valide (ex: 6, ou -3 si B gagne, 0 si nul).");
+    if (!winner) {
+      setError("Choisis qui a gagné (ou match nul).");
+      return;
+    }
+    const margin = winner === "draw" ? 0 : Number(marginInput);
+    if (winner !== "draw" && (!Number.isFinite(margin) || marginInput.trim() === "" || margin <= 0)) {
+      setError("Entre un écart de buts valide (un nombre positif).");
       return;
     }
     if (teamA.length === 0 || teamB.length === 0) {
@@ -370,7 +378,8 @@ export default function App() {
       return;
     }
     setError("");
-    const outcome = diff > 0 ? "A" : diff < 0 ? "B" : "draw";
+    const diff = winner === "A" ? margin : winner === "B" ? -margin : 0;
+    const outcome = winner;
     const absDiff = Math.abs(diff);
     const tier =
       outcome === "draw"
@@ -421,7 +430,8 @@ export default function App() {
     setTeamA([]);
     setTeamB([]);
     setOptions([]);
-    setDiffInput("");
+    setWinner(null);
+    setMarginInput("");
     setMvpOff("");
     setMvpDef("");
     setSelSwap(null);
@@ -435,6 +445,10 @@ export default function App() {
     () => [...players].filter((p) => !isActive(p)).sort((a, b) => a.name.localeCompare(b.name)),
     [players]
   );
+  const ranked = useMemo(() => {
+    const value = (p) => (sortKey === "off" ? p.off : sortKey === "def" ? p.def : overall(p));
+    return [...players].filter(isActive).sort((a, b) => value(b) - value(a));
+  }, [players, sortKey]);
 
   if (loading) {
     return (
@@ -488,6 +502,107 @@ export default function App() {
           {error}
         </div>
       )}
+
+      {/* TABS */}
+      <div style={{ display: "flex", borderBottom: "1px solid #E1E3E8", background: "#FFFFFF" }}>
+        {[
+          { key: "seance", label: "Séance" },
+          { key: "classement", label: "Classement" },
+        ].map((t) => (
+          <button
+            key={t.key}
+            onClick={() => setTab(t.key)}
+            style={{
+              flex: 1,
+              background: "none",
+              border: "none",
+              borderBottom: tab === t.key ? "3px solid #E1000F" : "3px solid transparent",
+              color: tab === t.key ? "#001E50" : "#6B6C72",
+              fontWeight: 700,
+              fontSize: 14,
+              padding: "12px 0",
+            }}
+          >
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {tab === "classement" && (
+        <section style={{ padding: "18px 20px" }}>
+          <div className="of-title" style={{ fontSize: 15, marginBottom: 10, color: "#001E50" }}>
+            Classement
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+            {[
+              { key: "off", label: "Attaque" },
+              { key: "def", label: "Défense" },
+              { key: "overall", label: "Combiné" },
+            ].map((s) => (
+              <button
+                key={s.key}
+                onClick={() => setSortKey(s.key)}
+                style={{
+                  flex: 1,
+                  padding: "8px 6px",
+                  borderRadius: 6,
+                  border: sortKey === s.key ? "2px solid #001E50" : "1px solid #E1E3E8",
+                  background: sortKey === s.key ? "#E7ECF5" : "#FFFFFF",
+                  fontWeight: 600,
+                  fontSize: 13,
+                }}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+
+          {ranked.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#6B6C72" }}>
+              Aucun joueur actif pour l'instant.
+            </div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {ranked.map((p, i) => (
+                <div
+                  key={p.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    background: "#FFFFFF",
+                    border: "1px solid #E1E3E8",
+                    borderRadius: 8,
+                    padding: "8px 10px",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 22,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: i < 3 ? "#E1000F" : "#6B6C72",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {i + 1}
+                  </div>
+                  <div style={{ flex: 1, fontSize: 14, fontWeight: 600 }}>{p.name}</div>
+                  <Badge tone={sortKey === "off" ? "off" : undefined}>Att {Math.round(p.off)}</Badge>
+                  <Badge tone={sortKey === "def" ? "def" : undefined}>Déf {Math.round(p.def)}</Badge>
+                  <Badge>{Math.round(overall(p))}</Badge>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 8 }}>
+            Classement des joueurs actifs uniquement. Le tri en cours est mis en évidence.
+          </div>
+        </section>
+      )}
+
+      {tab === "seance" && (
+        <>
 
       {/* ROSTER */}
       <section style={{ padding: "18px 20px" }}>
@@ -768,15 +883,51 @@ export default function App() {
 
             <div style={{ marginTop: 14 }}>
               <label style={{ fontSize: 12, color: "#6B6C72", display: "block", marginBottom: 4 }}>
-                Différence de buts (positif = A gagne, négatif = B gagne, 0 = nul)
+                Résultat
               </label>
-              <input
-                type="number"
-                value={diffInput}
-                onChange={(e) => setDiffInput(e.target.value)}
-                placeholder="ex: 6 ou -3"
-                style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 14 }}
-              />
+              <div style={{ display: "flex", gap: 6 }}>
+                {[
+                  { key: "A", label: "A gagne" },
+                  { key: "draw", label: "Nul" },
+                  { key: "B", label: "B gagne" },
+                ].map((o) => (
+                  <button
+                    key={o.key}
+                    onClick={() => {
+                      setWinner(o.key);
+                      if (o.key === "draw") setMarginInput("");
+                    }}
+                    style={{
+                      flex: 1,
+                      padding: "8px 6px",
+                      borderRadius: 6,
+                      border: winner === o.key ? "2px solid #001E50" : "1px solid #E1E3E8",
+                      background: winner === o.key ? "#E7ECF5" : "#FFFFFF",
+                      fontWeight: 600,
+                      fontSize: 13,
+                    }}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+
+              {winner && winner !== "draw" && (
+                <>
+                  <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
+                    Écart de buts
+                  </label>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    min="1"
+                    value={marginInput}
+                    onChange={(e) => setMarginInput(e.target.value)}
+                    placeholder="ex: 6"
+                    style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 14 }}
+                  />
+                </>
+              )}
               <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
                 Seuils actuels — petit ≤ {effectiveThresholds.small}, moyen ≤ {effectiveThresholds.medium}
                 {effectiveThresholds.n
@@ -1003,6 +1154,9 @@ export default function App() {
           </div>
         )}
       </section>
+
+        </>
+      )}
     </div>
   );
 }
