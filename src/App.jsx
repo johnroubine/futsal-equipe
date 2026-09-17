@@ -1,7 +1,13 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { storage } from "./storage";
 
-const K = 24; // vitesse d'ajustement des notes
+// K adaptatif : un joueur récent bouge vite (on ne sait rien de lui), un
+// joueur avec beaucoup de matchs bouge plus lentement — mais jamais figé :
+// le plancher K_MIN laisse une méforme se refléter en quelques séances.
+const K_MAX = 44;
+const K_MIN = 20;
+const K_SCALE = 8; // nombre de matchs sur lequel le K se resserre
+const kFor = (p) => K_MIN + (K_MAX - K_MIN) / (1 + (p.games || 0) / K_SCALE);
 const START = 1000;
 
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
@@ -57,7 +63,28 @@ function combos(arr, k) {
   return res;
 }
 
-function bestSplits(players) {
+const VARIETY_WEIGHT = 7; // en "points Elo équivalents" par binôme récemment répété
+
+// Poids des binômes ayant déjà joué ensemble lors des derniers matchs :
+// plus le match est récent, plus le binôme pèse. Sert à départager les
+// répartitions d'équilibre équivalent en faveur du brassage.
+function recentPairWeights(matches, depth = 4) {
+  const w = new Map();
+  matches.slice(0, depth).forEach((m, i) => {
+    const weight = (depth - i) / depth; // 1 pour le dernier match, puis décroissant
+    for (const team of [m.teamA, m.teamB]) {
+      for (let a = 0; a < team.length; a++) {
+        for (let b = a + 1; b < team.length; b++) {
+          const key = [team[a], team[b]].sort().join("||");
+          w.set(key, (w.get(key) || 0) + weight);
+        }
+      }
+    }
+  });
+  return w;
+}
+
+function bestSplits(players, pairWeights = new Map()) {
   // players: array of player objects present this week
   const n = players.length;
   const half = Math.floor(n / 2);
@@ -66,6 +93,16 @@ function bestSplits(players) {
     players.map((_, i) => i),
     half
   );
+  const repeatCost = (team) => {
+    let c = 0;
+    for (let a = 0; a < team.length; a++) {
+      for (let b = a + 1; b < team.length; b++) {
+        const key = [team[a].name, team[b].name].sort().join("||");
+        c += pairWeights.get(key) || 0;
+      }
+    }
+    return c;
+  };
   const seen = new Set();
   const options = [];
   for (const combo of idxCombos) {
@@ -86,10 +123,13 @@ function bestSplits(players) {
     const offB = teamB.reduce((s, p) => s + p.off, 0);
     const defA = teamA.reduce((s, p) => s + p.def, 0);
     const defB = teamB.reduce((s, p) => s + p.def, 0);
-    const diff = Math.abs(sumA - sumB) + 0.3 * Math.abs(offA - offB) + 0.3 * Math.abs(defA - defB);
-    options.push({ teamA, teamB, diff, sumA, sumB });
+    const balance =
+      Math.abs(sumA - sumB) + 0.3 * Math.abs(offA - offB) + 0.3 * Math.abs(defA - defB);
+    const repeats = repeatCost(teamA) + repeatCost(teamB);
+    const score = balance + VARIETY_WEIGHT * repeats;
+    options.push({ teamA, teamB, diff: balance, repeats, score, sumA, sumB });
   }
-  options.sort((a, b) => a.diff - b.diff);
+  options.sort((a, b) => a.score - b.score);
   return options.slice(0, 5);
 }
 
@@ -109,11 +149,10 @@ function autoThresholds(matches) {
   return { small: pick(1 / 3), medium: pick(2 / 3), n: diffs.length };
 }
 
-// Met à jour les notes à partir du résultat (victoire/nul/défaite) et d'un
-// palier d'écart, plutôt que d'un score exact — plus robuste sur des matchs
-// à 20-25 buts où l'écart final est bruité. Même signal pour attaque et
-// défense de chaque équipe ; seule l'attente (notes de chacun) les différencie.
-function computeUpdateFromOutcome(teamA, teamB, outcome, tier) {
+// Renvoie les termes d'erreur (performance observée − attendue) par équipe.
+// Le delta de chaque joueur est ensuite errX × son K personnel × le
+// multiplicateur d'écart, ce qui laisse les nouveaux bouger plus vite.
+function computeErrorsFromOutcome(teamA, teamB, outcome, tier) {
   const avg = (arr, key) => arr.reduce((s, p) => s + p[key], 0) / arr.length;
   const offA = avg(teamA, "off"),
     defA = avg(teamA, "def"),
@@ -123,13 +162,41 @@ function computeUpdateFromOutcome(teamA, teamB, outcome, tier) {
   const sA = outcome === "A" ? 1 : outcome === "draw" ? 0.5 : 0;
   const sB = 1 - sA;
 
-  const dOffA = K * M * (sA - expected(offA - defB));
-  const dDefA = K * M * (sA - expected(defA - offB));
-  const dOffB = K * M * (sB - expected(offB - defA));
-  const dDefB = K * M * (sB - expected(defB - offA));
-
-  return { dOffA, dDefA, dOffB, dDefB };
+  return {
+    M,
+    errOffA: sA - expected(offA - defB),
+    errDefA: sA - expected(defA - offB),
+    errOffB: sB - expected(offB - defA),
+    errDefB: sB - expected(defB - offA),
+  };
 }
+
+// Petite courbe de progression (attaque en rouge, défense en bleu) tracée à
+// partir des notes enregistrées après chaque match.
+const Sparkline = ({ series, width = 300, height = 64 }) => {
+  const all = series.flatMap((s) => s.values);
+  if (all.length < 2) return null;
+  const min = Math.min(...all);
+  const max = Math.max(...all);
+  const span = max - min || 1;
+  const pad = 4;
+  const x = (i, n) => pad + (i * (width - 2 * pad)) / Math.max(1, n - 1);
+  const y = (v) => height - pad - ((v - min) / span) * (height - 2 * pad);
+  return (
+    <svg viewBox={`0 0 ${width} ${height}`} style={{ width: "100%", height, display: "block" }}>
+      {series.map((s) => (
+        <polyline
+          key={s.label}
+          fill="none"
+          stroke={s.color}
+          strokeWidth="2"
+          strokeLinejoin="round"
+          points={s.values.map((v, i) => `${x(i, s.values.length)},${y(v)}`).join(" ")}
+        />
+      ))}
+    </svg>
+  );
+};
 
 const Badge = ({ children, tone = "default" }) => {
   const tones = {
@@ -176,8 +243,12 @@ export default function App() {
   const [manualSmall, setManualSmall] = useState(2);
   const [manualMedium, setManualMedium] = useState(5);
   const [expandedPlayerId, setExpandedPlayerId] = useState(null);
+  const [undo, setUndo] = useState(null);
+  const [renamingId, setRenamingId] = useState(null);
+  const [renameValue, setRenameValue] = useState("");
   const [tab, setTab] = useState("seance"); // "seance" | "classement"
   const [sortKey, setSortKey] = useState("overall"); // "off" | "def" | "overall"
+  const [recordSort, setRecordSort] = useState("pct"); // "pct" | "wins" | "games"
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -186,6 +257,7 @@ export default function App() {
         const p = await storage.get("futsal-players").catch(() => null);
         const m = await storage.get("futsal-matches").catch(() => null);
         const t = await storage.get("futsal-thresholds").catch(() => null);
+        const u = await storage.get("futsal-undo").catch(() => null);
         if (p) setPlayers(JSON.parse(p.value));
         if (m) setMatches(JSON.parse(m.value));
         if (t) {
@@ -193,6 +265,10 @@ export default function App() {
           setThresholdMode(cfg.mode || "auto");
           setManualSmall(cfg.small ?? 2);
           setManualMedium(cfg.medium ?? 5);
+        }
+        if (u) {
+          const snap = JSON.parse(u.value);
+          if (snap && Array.isArray(snap.players)) setUndo(snap);
         }
       } catch (e) {
         setError("Chargement impossible, on repart d'une base vide.");
@@ -229,6 +305,15 @@ export default function App() {
     }
   };
 
+  const persistUndo = async (snap) => {
+    setUndo(snap);
+    try {
+      await storage.set("futsal-undo", JSON.stringify(snap));
+    } catch (e) {
+      // l'annulation est un confort : si la sauvegarde échoue, on n'alerte pas
+    }
+  };
+
   const fileInputRef = useRef(null);
 
   const exportData = () => {
@@ -261,6 +346,12 @@ export default function App() {
           setError("Fichier invalide : structure inattendue.");
           return;
         }
+        if (
+          !window.confirm(
+            `Importer ce fichier remplacera l'effectif actuel (${players.length} joueurs) et l'historique (${matches.length} matchs) par ceux du fichier (${data.players.length} joueurs, ${data.matches.length} matchs). Continuer ?`
+          )
+        )
+          return;
         persistPlayers(data.players);
         persistMatches(data.matches);
         if (data.thresholds) {
@@ -273,6 +364,42 @@ export default function App() {
     };
     reader.readAsText(file);
     e.target.value = "";
+  };
+
+  const undoLastMatch = () => {
+    if (!undo || !Array.isArray(undo.players) || matches.length === 0) {
+      setError("Rien à annuler.");
+      return;
+    }
+    setError("");
+    persistPlayers(undo.players);
+    persistMatches(matches.slice(1));
+    persistUndo(null);
+  };
+
+  const renamePlayer = (id, rawName) => {
+    const name = rawName.trim();
+    const old = players.find((p) => p.id === id);
+    if (!old || !name || name === old.name) return;
+    if (players.some((p) => p.id !== id && p.name === name)) {
+      setError("Un autre joueur porte déjà ce nom.");
+      return;
+    }
+    setError("");
+    persistPlayers(players.map((p) => (p.id === id ? { ...p, name } : p)));
+    // L'historique stocke les noms : on le réécrit pour ne pas perdre le passé.
+    const swap = (n) => (n === old.name ? name : n);
+    persistMatches(
+      matches.map((m) => ({
+        ...m,
+        teamA: m.teamA.map(swap),
+        teamB: m.teamB.map(swap),
+        mvpOffName: m.mvpOffName ? swap(m.mvpOffName) : m.mvpOffName,
+        mvpDefName: m.mvpDefName ? swap(m.mvpDefName) : m.mvpDefName,
+      }))
+    );
+    setRenamingId(null);
+    setRenameValue("");
   };
 
   const addPlayer = () => {
@@ -292,12 +419,28 @@ export default function App() {
   };
 
   const removePlayer = (id) => {
-    persistPlayers(players.filter((p) => p.id !== id));
+    const p = players.find((x) => x.id === id);
+    if (
+      p &&
+      !window.confirm(
+        `Supprimer définitivement ${p.name} ? Sa fiche et ses notes seront perdues (son nom restera dans l'historique des matchs).`
+      )
+    )
+      return;
+    persistPlayers(players.filter((x) => x.id !== id));
     setPresent((prev) => {
       const n = new Set(prev);
       n.delete(id);
       return n;
     });
+  };
+
+  const clearPresent = () => {
+    setPresent(new Set());
+    setTeamA([]);
+    setTeamB([]);
+    setOptions([]);
+    setSelSwap(null);
   };
 
   const togglePresent = (id) => {
@@ -313,12 +456,18 @@ export default function App() {
 
   const generate = () => {
     const list = players.filter((p) => present.has(p.id));
-    if (list.length < 2) {
-      setError("Sélectionne au moins 2 joueurs présents.");
+    if (list.length < 4) {
+      setError("Sélectionne au moins 4 joueurs présents.");
+      return;
+    }
+    if (list.length % 2 !== 0) {
+      setError(
+        `${list.length} joueurs sélectionnés : il en faut un nombre pair pour former deux équipes égales (10 pour du 5 contre 5).`
+      );
       return;
     }
     setError("");
-    const opts = bestSplits(list);
+    const opts = bestSplits(list, recentPairWeights(matches));
     setOptions(opts);
     setOptIdx(0);
     setTeamA(opts[0].teamA);
@@ -389,29 +538,39 @@ export default function App() {
         : absDiff <= effectiveThresholds.medium
         ? "medium"
         : "large";
-    const { dOffA, dDefA, dOffB, dDefB } = computeUpdateFromOutcome(teamA, teamB, outcome, tier);
+    const { M, errOffA, errDefA, errOffB, errDefB } = computeErrorsFromOutcome(
+      teamA,
+      teamB,
+      outcome,
+      tier
+    );
     const idsA = new Set(teamA.map((p) => p.id));
     const idsB = new Set(teamB.map((p) => p.id));
+    const ratingsAfter = {};
     const next = players.map((p) => {
+      const k = kFor(p) * M;
       let off = p.off,
         def = p.def,
         games = p.games;
       if (idsA.has(p.id)) {
-        off += dOffA;
-        def += dDefA;
+        off += k * errOffA;
+        def += k * errDefA;
         games += 1;
       } else if (idsB.has(p.id)) {
-        off += dOffB;
-        def += dDefB;
+        off += k * errOffB;
+        def += k * errDefB;
         games += 1;
       } else {
         return p;
       }
       if (p.id === mvpOff) off += MVP_BONUS;
       if (p.id === mvpDef) def += MVP_BONUS;
+      ratingsAfter[p.id] = { off, def };
       return { ...p, off, def, games };
     });
     const allNames = new Map([...teamA, ...teamB].map((p) => [p.id, p.name]));
+    // Snapshot d'avant-match, pour pouvoir annuler la dernière saisie.
+    persistUndo({ players, matchId: null, savedAt: new Date().toISOString() });
     persistPlayers(next);
     persistMatches([
       {
@@ -424,12 +583,14 @@ export default function App() {
         tier,
         mvpOffName: allNames.get(mvpOff) || null,
         mvpDefName: allNames.get(mvpDef) || null,
+        ratingsAfter,
       },
       ...matches,
     ]);
     setTeamA([]);
     setTeamB([]);
     setOptions([]);
+    setPresent(new Set());
     setWinner(null);
     setMarginInput("");
     setMvpOff("");
@@ -450,6 +611,27 @@ export default function App() {
     return [...players].filter(isActive).sort((a, b) => value(b) - value(a));
   }, [players, sortKey]);
 
+  // Bilan V/N/D par joueur actif. Le pourcentage compte un nul comme un
+  // demi-succès, et se calcule sur les matchs effectivement joués.
+  const records = useMemo(() => {
+    const rows = players.filter(isActive).map((p) => {
+      const s = playerStats(p.name, matches);
+      const played = s.wins + s.draws + s.losses;
+      const pct = played === 0 ? null : ((s.wins + 0.5 * s.draws) / played) * 100;
+      return { id: p.id, name: p.name, ...s, played, pct };
+    });
+    rows.sort((a, b) => {
+      if (recordSort === "wins") return b.wins - a.wins || b.played - a.played;
+      if (recordSort === "games") return b.played - a.played || b.wins - a.wins;
+      // "pct" : les joueurs sans match joué passent en dernier
+      if (a.pct === null && b.pct === null) return a.name.localeCompare(b.name);
+      if (a.pct === null) return 1;
+      if (b.pct === null) return -1;
+      return b.pct - a.pct || b.played - a.played;
+    });
+    return rows;
+  }, [players, matches, recordSort]);
+
   if (loading) {
     return (
       <div style={{ fontFamily: "system-ui", padding: 24, color: "#001E50" }}>
@@ -465,7 +647,7 @@ export default function App() {
         background: "#F7F8FA",
         color: "#16171A",
         minHeight: "100%",
-        padding: "0 0 40px 0",
+        padding: "0 0 96px 0",
       }}
     >
       <style>{`
@@ -508,6 +690,7 @@ export default function App() {
         {[
           { key: "seance", label: "Séance" },
           { key: "classement", label: "Classement" },
+          { key: "bilan", label: "Bilan V/D" },
         ].map((t) => (
           <button
             key={t.key}
@@ -601,6 +784,96 @@ export default function App() {
         </section>
       )}
 
+      {tab === "bilan" && (
+        <section style={{ padding: "18px 20px" }}>
+          <div className="of-title" style={{ fontSize: 15, marginBottom: 10, color: "#001E50" }}>
+            Bilan victoires / défaites
+          </div>
+          <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+            {[
+              { key: "pct", label: "% victoires" },
+              { key: "wins", label: "Victoires" },
+              { key: "games", label: "Matchs joués" },
+            ].map((s) => (
+              <button
+                key={s.key}
+                onClick={() => setRecordSort(s.key)}
+                style={{
+                  flex: 1,
+                  padding: "8px 6px",
+                  borderRadius: 6,
+                  border: recordSort === s.key ? "2px solid #001E50" : "1px solid #E1E3E8",
+                  background: recordSort === s.key ? "#E7ECF5" : "#FFFFFF",
+                  fontWeight: 600,
+                  fontSize: 12.5,
+                }}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+
+          {records.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#6B6C72" }}>Aucun joueur actif pour l'instant.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {records.map((r, i) => (
+                <div
+                  key={r.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    background: "#FFFFFF",
+                    border: "1px solid #E1E3E8",
+                    borderRadius: 8,
+                    padding: "8px 10px",
+                  }}
+                >
+                  <div
+                    style={{
+                      width: 22,
+                      fontSize: 13,
+                      fontWeight: 700,
+                      color: i < 3 ? "#E1000F" : "#6B6C72",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {i + 1}
+                  </div>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 14, fontWeight: 600 }}>{r.name}</div>
+                    <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 1 }}>
+                      {r.played === 0
+                        ? "aucun match joué"
+                        : `${r.wins}V · ${r.draws}N · ${r.losses}D sur ${r.played} match${r.played > 1 ? "s" : ""}`}
+                      {matches.length > 0
+                        ? ` · présence ${Math.round((r.played / matches.length) * 100)} %`
+                        : ""}
+                    </div>
+                  </div>
+                  <div
+                    style={{
+                      fontSize: 15,
+                      fontWeight: 700,
+                      color: r.pct === null ? "#6B6C72" : "#001E50",
+                      fontVariantNumeric: "tabular-nums",
+                    }}
+                  >
+                    {r.pct === null ? "—" : `${Math.round(r.pct)} %`}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 8 }}>
+            Le pourcentage compte un match nul comme un demi-succès, calculé sur les matchs
+            réellement joués. Attention aux petits échantillons : un joueur à 2 matchs peut
+            afficher 100 % sans que ce soit représentatif.
+          </div>
+        </section>
+      )}
+
       {tab === "seance" && (
         <>
 
@@ -666,8 +939,56 @@ export default function App() {
                       type="checkbox"
                       checked={present.has(p.id)}
                       onChange={() => togglePresent(p.id)}
-                      style={{ width: 16, height: 16 }}
+                      style={{ width: 22, height: 22, margin: "4px 2px", flexShrink: 0 }}
                     />
+                    {renamingId === p.id ? (
+                      <>
+                        <input
+                          type="text"
+                          value={renameValue}
+                          autoFocus
+                          onChange={(e) => setRenameValue(e.target.value)}
+                          onKeyDown={(e) => e.key === "Enter" && renamePlayer(p.id, renameValue)}
+                          style={{
+                            flex: 1,
+                            padding: "6px 8px",
+                            borderRadius: 5,
+                            border: "1px solid #E1E3E8",
+                            fontSize: 14,
+                          }}
+                        />
+                        <button
+                          onClick={() => renamePlayer(p.id, renameValue)}
+                          style={{
+                            background: "#001E50",
+                            color: "#FFFFFF",
+                            border: "none",
+                            borderRadius: 5,
+                            fontSize: 11.5,
+                            padding: "5px 8px",
+                            fontWeight: 700,
+                          }}
+                        >
+                          OK
+                        </button>
+                        <button
+                          onClick={() => {
+                            setRenamingId(null);
+                            setRenameValue("");
+                          }}
+                          style={{
+                            background: "none",
+                            border: "none",
+                            color: "#6B6C72",
+                            fontSize: 13,
+                            padding: "0 4px",
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </>
+                    ) : (
+                      <>
                     <div
                       onClick={() => setExpandedPlayerId(expanded ? null : p.id)}
                       style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
@@ -677,21 +998,15 @@ export default function App() {
                       <Badge tone="def">Déf {Math.round(p.def)}</Badge>
                       <Badge>{Math.round(overall(p))}</Badge>
                     </div>
-                    <button
-                      onClick={() => toggleActive(p.id)}
-                      style={{
-                        background: "none",
-                        border: "1px solid #E1E3E8",
-                        borderRadius: 5,
-                        color: "#6B6C72",
-                        fontSize: 11.5,
-                        padding: "4px 7px",
-                        fontWeight: 600,
-                      }}
-                      aria-label={`Archiver ${p.name}`}
+                    <div
+                      onClick={() => setExpandedPlayerId(expanded ? null : p.id)}
+                      style={{ color: "#6B6C72", fontSize: 13, padding: "6px 2px", cursor: "pointer" }}
+                      aria-label={`Détails de ${p.name}`}
                     >
-                      Archiver
-                    </button>
+                      {expanded ? "▾" : "▸"}
+                    </div>
+                      </>
+                    )}
                   </div>
 
                   {expanded && (
@@ -705,12 +1020,79 @@ export default function App() {
                         fontSize: 12.5,
                       }}
                     >
+                      <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+                        <button
+                          onClick={() => {
+                            setRenamingId(p.id);
+                            setRenameValue(p.name);
+                          }}
+                          style={{
+                            flex: 1,
+                            background: "none",
+                            border: "1px solid #E1E3E8",
+                            borderRadius: 6,
+                            color: "#001E50",
+                            fontSize: 12.5,
+                            padding: "9px 8px",
+                            fontWeight: 600,
+                          }}
+                        >
+                          Renommer
+                        </button>
+                        <button
+                          onClick={() => toggleActive(p.id)}
+                          style={{
+                            flex: 1,
+                            background: "none",
+                            border: "1px solid #E1E3E8",
+                            borderRadius: 6,
+                            color: "#6B6C72",
+                            fontSize: 12.5,
+                            padding: "9px 8px",
+                            fontWeight: 600,
+                          }}
+                        >
+                          Archiver
+                        </button>
+                      </div>
                       <div style={{ display: "flex", gap: 12, marginBottom: 8, color: "#001E50", fontWeight: 600 }}>
                         <span>{stats.wins}V</span>
                         <span>{stats.draws}N</span>
                         <span>{stats.losses}D</span>
                         <span style={{ color: "#6B6C72", fontWeight: 400 }}>· {p.games} match{p.games > 1 ? "s" : ""} au total</span>
                       </div>
+                      <div style={{ color: "#6B6C72", marginBottom: 8 }}>
+                        Présence :{" "}
+                        {matches.length === 0
+                          ? "—"
+                          : `${Math.round((stats.history.length / matches.length) * 100)} % (${stats.history.length}/${matches.length} séances)`}
+                      </div>
+                      {(() => {
+                        const chrono = [...stats.history].reverse();
+                        const offVals = [],
+                          defVals = [];
+                        for (const m of chrono) {
+                          const r = m.ratingsAfter && m.ratingsAfter[p.id];
+                          if (r) {
+                            offVals.push(r.off);
+                            defVals.push(r.def);
+                          }
+                        }
+                        if (offVals.length < 2) return null;
+                        return (
+                          <div style={{ marginBottom: 10 }}>
+                            <div style={{ color: "#6B6C72", marginBottom: 2 }}>
+                              Progression (attaque en rouge, défense en bleu)
+                            </div>
+                            <Sparkline
+                              series={[
+                                { label: "off", values: offVals, color: "#E1000F" },
+                                { label: "def", values: defVals, color: "#001E50" },
+                              ]}
+                            />
+                          </div>
+                        );
+                      })()}
                       <div style={{ display: "flex", gap: 10, marginBottom: 10 }}>
                         <Badge tone="off">MVP att. × {stats.mvpOff}</Badge>
                         <Badge tone="def">MVP déf. × {stats.mvpDef}</Badge>
@@ -807,18 +1189,33 @@ export default function App() {
 
       {/* SEANCE */}
       <section style={{ padding: "6px 20px 18px" }}>
-        <div className="of-title" style={{ fontSize: 15, marginBottom: 10, color: "#001E50" }}>
-          Séance du jour — {present.size} présent{present.size > 1 ? "s" : ""}
+        <div className="of-title" style={{ fontSize: 15, marginBottom: 6, color: "#001E50" }}>
+          Séance du jour — {present.size}/10 sélectionné{present.size > 1 ? "s" : ""}
         </div>
+        {present.size > 0 && (
+          <div style={{ fontSize: 12, color: "#6B6C72", marginBottom: 10 }}>
+            {players
+              .filter((p) => present.has(p.id))
+              .map((p) => p.name)
+              .join(", ")}
+            {" · "}
+            <span
+              onClick={clearPresent}
+              style={{ color: "#B4000F", fontWeight: 600, cursor: "pointer" }}
+            >
+              vider la sélection
+            </span>
+          </div>
+        )}
         <button
           onClick={generate}
-          disabled={present.size < 2}
+          disabled={present.size < 4}
           style={{
-            background: present.size < 2 ? "#E1E3E8" : "#E1000F",
-            color: present.size < 2 ? "#6B6C72" : "#FFFFFF",
+            background: present.size < 4 ? "#E1E3E8" : "#E1000F",
+            color: present.size < 4 ? "#6B6C72" : "#FFFFFF",
             border: "none",
             borderRadius: 6,
-            padding: "10px 16px",
+            padding: "13px 16px",
             fontWeight: 700,
             fontSize: 14,
             width: "100%",
@@ -861,6 +1258,13 @@ export default function App() {
             </div>
             <div style={{ fontSize: 11, color: "#6B6C72", marginTop: 6 }}>
               Touche un joueur de chaque équipe pour permuter leurs places.
+              {options[optIdx]
+                ? ` Écart d'équilibre ${Math.round(options[optIdx].diff)} pts · ${
+                    options[optIdx].repeats > 0
+                      ? "quelques binômes des dernières semaines reconduits"
+                      : "aucun binôme récent reconduit"
+                  }.`
+                : ""}
             </div>
 
             {options.length > 1 && (
@@ -1123,6 +1527,28 @@ export default function App() {
         >
           {showHistory ? "▾" : "▸"} Historique ({matches.length})
         </button>
+        {undo && matches.length > 0 && (
+          <div style={{ marginTop: 8 }}>
+            <button
+              onClick={undoLastMatch}
+              style={{
+                background: "none",
+                border: "1px solid #E1000F",
+                color: "#B4000F",
+                borderRadius: 6,
+                padding: "8px 12px",
+                fontSize: 13,
+                fontWeight: 700,
+              }}
+            >
+              Annuler le dernier match
+            </button>
+            <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
+              Restaure les notes d'avant le dernier résultat enregistré et le retire de
+              l'historique. Disponible pour le dernier match seulement.
+            </div>
+          </div>
+        )}
         {showHistory && (
           <div style={{ marginTop: 10, display: "flex", flexDirection: "column", gap: 6 }}>
             {matches.length === 0 && (
@@ -1156,6 +1582,61 @@ export default function App() {
       </section>
 
         </>
+      )}
+
+      {tab === "seance" && present.size > 0 && teamA.length === 0 && (
+        <div
+          style={{
+            position: "fixed",
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "#001E50",
+            padding: "10px 16px",
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            boxShadow: "0 -2px 10px rgba(0,0,0,0.18)",
+            zIndex: 20,
+          }}
+        >
+          <div style={{ color: "#FFFFFF", fontSize: 13, fontWeight: 700, whiteSpace: "nowrap" }}>
+            {present.size}/10
+            <span style={{ color: "#A9B8D6", fontWeight: 500 }}>
+              {present.size % 2 !== 0 ? " (nombre impair)" : ""}
+            </span>
+          </div>
+          <button
+            onClick={generate}
+            disabled={present.size < 4}
+            style={{
+              flex: 1,
+              background: present.size < 4 ? "#3C5580" : "#E1000F",
+              color: "#FFFFFF",
+              border: "none",
+              borderRadius: 6,
+              padding: "12px 10px",
+              fontWeight: 700,
+              fontSize: 14,
+            }}
+          >
+            Générer les équipes
+          </button>
+          <button
+            onClick={clearPresent}
+            style={{
+              background: "none",
+              border: "1px solid #3C5580",
+              color: "#A9B8D6",
+              borderRadius: 6,
+              padding: "12px 10px",
+              fontSize: 12.5,
+              fontWeight: 600,
+            }}
+          >
+            Vider
+          </button>
+        </div>
       )}
     </div>
   );
