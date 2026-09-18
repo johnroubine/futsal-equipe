@@ -20,7 +20,8 @@ function playerStats(name, matches) {
     draws = 0,
     losses = 0,
     mvpOff = 0,
-    mvpDef = 0;
+    mvpDef = 0,
+    pm = 0;
   const history = [];
   for (const m of matches) {
     const inA = m.teamA.includes(name);
@@ -37,11 +38,31 @@ function playerStats(name, matches) {
       result = "Défaite";
       losses++;
     }
+    // Différentiel de buts vu du joueur : positif s'il était du bon côté.
+    if (Number.isFinite(m.diff)) pm += inA ? m.diff : -m.diff;
     if (m.mvpOffName === name) mvpOff++;
     if (m.mvpDefName === name) mvpDef++;
     history.push({ ...m, result });
   }
-  return { wins, draws, losses, mvpOff, mvpDef, history };
+  return { wins, draws, losses, mvpOff, mvpDef, pm, history };
+}
+
+// Incertitude affichée à côté de la note : large pour un nouveau, resserrée
+// avec l'expérience. Traduit visuellement ce que fait le K adaptatif.
+const uncertainty = (p) => Math.round(150 / Math.sqrt((p.games || 0) + 2) / 5) * 5;
+
+// Forme récente : variation de la note combinée sur les N derniers matchs
+// joués, calculée depuis les notes enregistrées après chaque match.
+function recentForm(playerId, history, window = 5) {
+  const snaps = [];
+  for (const m of history) {
+    const r = m.ratingsAfter && m.ratingsAfter[playerId];
+    if (r) snaps.push((r.off + r.def) / 2);
+    if (snaps.length > window) break;
+  }
+  if (snaps.length < 2) return null;
+  // history est du plus récent au plus ancien
+  return snaps[0] - snaps[snaps.length - 1];
 }
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
@@ -134,7 +155,11 @@ function bestSplits(players, pairWeights = new Map()) {
 }
 
 const TIER_MULT = { small: 1, medium: 1.6, large: 2.3 };
-const MVP_BONUS = 10;
+// Poids du vote MVP. C'est la seule source d'information qui distingue
+// réellement l'attaque de la défense (le résultat du match, lui, s'applique
+// identiquement aux deux). Testé par simulation : 30 sépare bien les deux
+// notes sans dégrader le classement combiné ; au-delà, plus de gain.
+const MVP_BONUS = 30;
 const DEFAULT_THRESHOLDS = { small: 2, medium: 5 }; // repères de départ, avant d'avoir assez de matchs
 
 // Seuils suggérés par terciles à partir des écarts de buts déjà enregistrés
@@ -148,6 +173,21 @@ function autoThresholds(matches) {
   const pick = (p) => diffs[Math.min(diffs.length - 1, Math.floor(p * diffs.length))];
   return { small: pick(1 / 3), medium: pick(2 / 3), n: diffs.length };
 }
+
+// Pondération du gardien. En futsal il détermine une grande part des buts
+// encaissés : il absorbe donc plus du signal défensif, et les joueurs de
+// champ en sont d'autant épargnés. À l'inverse il pèse peu en attaque.
+// Les poids sont normalisés pour que le total par équipe reste constant.
+const GK_DEF_WEIGHT = 2;
+const GK_OFF_WEIGHT = 0.5;
+const gkWeights = (teamSize, isKeeper, hasKeeper) => {
+  if (!hasKeeper || teamSize < 2) return { off: 1, def: 1 };
+  if (isKeeper) return { off: GK_OFF_WEIGHT, def: GK_DEF_WEIGHT };
+  return {
+    off: (teamSize - GK_OFF_WEIGHT) / (teamSize - 1),
+    def: (teamSize - GK_DEF_WEIGHT) / (teamSize - 1),
+  };
+};
 
 // Renvoie les termes d'erreur (performance observée − attendue) par équipe.
 // Le delta de chaque joueur est ensuite errX × son K personnel × le
@@ -236,6 +276,8 @@ export default function App() {
   const [marginInput, setMarginInput] = useState("");
   const [mvpOff, setMvpOff] = useState("");
   const [mvpDef, setMvpDef] = useState("");
+  const [gkA, setGkA] = useState("");
+  const [gkB, setGkB] = useState("");
   const [showHistory, setShowHistory] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -248,7 +290,7 @@ export default function App() {
   const [renameValue, setRenameValue] = useState("");
   const [tab, setTab] = useState("seance"); // "seance" | "classement"
   const [sortKey, setSortKey] = useState("overall"); // "off" | "def" | "overall"
-  const [recordSort, setRecordSort] = useState("pct"); // "pct" | "wins" | "games"
+  const [recordSort, setRecordSort] = useState("pm"); // "pm" | "pct" | "wins" | "games"
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -553,12 +595,14 @@ export default function App() {
         def = p.def,
         games = p.games;
       if (idsA.has(p.id)) {
-        off += k * errOffA;
-        def += k * errDefA;
+        const w = gkWeights(teamA.length, p.id === gkA, !!gkA);
+        off += k * errOffA * w.off;
+        def += k * errDefA * w.def;
         games += 1;
       } else if (idsB.has(p.id)) {
-        off += k * errOffB;
-        def += k * errDefB;
+        const w = gkWeights(teamB.length, p.id === gkB, !!gkB);
+        off += k * errOffB * w.off;
+        def += k * errDefB * w.def;
         games += 1;
       } else {
         return p;
@@ -583,6 +627,8 @@ export default function App() {
         tier,
         mvpOffName: allNames.get(mvpOff) || null,
         mvpDefName: allNames.get(mvpDef) || null,
+        gkAName: allNames.get(gkA) || null,
+        gkBName: allNames.get(gkB) || null,
         ratingsAfter,
       },
       ...matches,
@@ -595,6 +641,8 @@ export default function App() {
     setMarginInput("");
     setMvpOff("");
     setMvpDef("");
+    setGkA("");
+    setGkB("");
     setSelSwap(null);
   };
 
@@ -618,11 +666,18 @@ export default function App() {
       const s = playerStats(p.name, matches);
       const played = s.wins + s.draws + s.losses;
       const pct = played === 0 ? null : ((s.wins + 0.5 * s.draws) / played) * 100;
-      return { id: p.id, name: p.name, ...s, played, pct };
+      const pmAvg = played === 0 ? null : s.pm / played;
+      return { id: p.id, name: p.name, ...s, played, pct, pmAvg };
     });
     rows.sort((a, b) => {
       if (recordSort === "wins") return b.wins - a.wins || b.played - a.played;
       if (recordSort === "games") return b.played - a.played || b.wins - a.wins;
+      if (recordSort === "pm") {
+        if (a.pmAvg === null && b.pmAvg === null) return a.name.localeCompare(b.name);
+        if (a.pmAvg === null) return 1;
+        if (b.pmAvg === null) return -1;
+        return b.pmAvg - a.pmAvg || b.played - a.played;
+      }
       // "pct" : les joueurs sans match joué passent en dernier
       if (a.pct === null && b.pct === null) return a.name.localeCompare(b.name);
       if (a.pct === null) return 1;
@@ -651,32 +706,55 @@ export default function App() {
       }}
     >
       <style>{`
-        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700&display=swap');
+        @import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&family=Roboto+Mono:wght@500;700&display=swap');
         .of-title { font-family: 'Manrope', sans-serif; letter-spacing: -0.01em; }
         button { cursor: pointer; font-family: inherit; }
         input[type=text], input[type=number] { font-family: inherit; }
       `}</style>
 
-      <div style={{ background: "#001E50", padding: "22px 20px 26px", position: "relative" }}>
+      <div style={{ background: "#001E50", padding: "13px 18px 0", position: "relative" }}>
         <div
           style={{
             position: "absolute",
-            top: 20,
-            right: 20,
-            width: 24,
-            height: 24,
+            top: 13,
+            right: 18,
+            width: 20,
+            height: 20,
             borderRadius: "50%",
             background: "radial-gradient(circle, #E1000F 0 33%, #FFFFFF 33% 66%, #001E50 66% 100%)",
             boxShadow: "0 0 0 1px rgba(255,255,255,0.3)",
           }}
         />
-        <div className="of-title" style={{ color: "#FFFFFF", fontSize: 26, fontWeight: 700 }}>
+        <div className="of-title" style={{ color: "#FFFFFF", fontSize: 15.5, fontWeight: 800 }}>
           Futsal — équipes équilibrées
         </div>
-        <div style={{ color: "#A9B8D6", fontSize: 13, marginTop: 4 }}>
-          {leaderboard.length} joueurs actifs · notes attaque / défense séparées
+        <div style={{ color: "#8FA3C8", fontSize: 11.5, marginTop: 2 }}>
+          {leaderboard.length} joueurs actifs
         </div>
-        <div style={{ width: 44, height: 3, background: "#E1000F", marginTop: 10 }} />
+        <div style={{ display: "flex", marginTop: 11 }}>
+          {[
+            { key: "seance", label: "Séance" },
+            { key: "classement", label: "Classement" },
+            { key: "bilan", label: "Bilan" },
+          ].map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              style={{
+                flex: 1,
+                background: "none",
+                border: "none",
+                borderBottom: tab === t.key ? "2px solid #E1000F" : "2px solid transparent",
+                color: tab === t.key ? "#FFFFFF" : "#8FA3C8",
+                fontWeight: 700,
+                fontSize: 12.5,
+                padding: "0 0 9px",
+              }}
+            >
+              {t.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {error && (
@@ -684,32 +762,6 @@ export default function App() {
           {error}
         </div>
       )}
-
-      {/* TABS */}
-      <div style={{ display: "flex", borderBottom: "1px solid #E1E3E8", background: "#FFFFFF" }}>
-        {[
-          { key: "seance", label: "Séance" },
-          { key: "classement", label: "Classement" },
-          { key: "bilan", label: "Bilan V/D" },
-        ].map((t) => (
-          <button
-            key={t.key}
-            onClick={() => setTab(t.key)}
-            style={{
-              flex: 1,
-              background: "none",
-              border: "none",
-              borderBottom: tab === t.key ? "3px solid #E1000F" : "3px solid transparent",
-              color: tab === t.key ? "#001E50" : "#6B6C72",
-              fontWeight: 700,
-              fontSize: 14,
-              padding: "12px 0",
-            }}
-          >
-            {t.label}
-          </button>
-        ))}
-      </div>
 
       {tab === "classement" && (
         <section style={{ padding: "18px 20px" }}>
@@ -753,27 +805,65 @@ export default function App() {
                     display: "flex",
                     alignItems: "center",
                     gap: 8,
-                    background: "#FFFFFF",
-                    border: "1px solid #E1E3E8",
-                    borderRadius: 8,
-                    padding: "8px 10px",
+                    borderBottom: "1px solid #F0F1F4",
+                    padding: "9px 2px",
                   }}
                 >
                   <div
                     style={{
                       width: 22,
-                      fontSize: 13,
+                      fontFamily: "'Roboto Mono', monospace",
+                      fontSize: 12.5,
                       fontWeight: 700,
-                      color: i < 3 ? "#E1000F" : "#6B6C72",
-                      fontVariantNumeric: "tabular-nums",
+                      color: i < 3 ? "#001E50" : "#A8ABB2",
                     }}
                   >
                     {i + 1}
                   </div>
-                  <div style={{ flex: 1, fontSize: 14, fontWeight: 600 }}>{p.name}</div>
-                  <Badge tone={sortKey === "off" ? "off" : undefined}>Att {Math.round(p.off)}</Badge>
-                  <Badge tone={sortKey === "def" ? "def" : undefined}>Déf {Math.round(p.def)}</Badge>
-                  <Badge>{Math.round(overall(p))}</Badge>
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 14, fontWeight: 700, color: "#16171A" }}>{p.name}</div>
+                    {(() => {
+                      const form = recentForm(p.id, playerStats(p.name, matches).history);
+                      return (
+                        <div style={{ fontSize: 10, fontWeight: 600, color: "#A8ABB2", marginTop: 1 }}>
+                          ± {uncertainty(p)}
+                          {form !== null && Math.abs(form) >= 1
+                            ? ` · forme ${form > 0 ? "↑ +" : "↓ "}${Math.round(form)}`
+                            : ""}
+                        </div>
+                      );
+                    })()}
+                  </div>
+                  {[
+                    { v: p.off, key: "off" },
+                    { v: p.def, key: "def" },
+                  ].map(({ v, key }) => (
+                    <div
+                      key={key}
+                      style={{
+                        width: 42,
+                        textAlign: "right",
+                        fontFamily: "'Roboto Mono', monospace",
+                        fontSize: 12.5,
+                        fontWeight: sortKey === key ? 700 : 500,
+                        color: sortKey === key ? "#001E50" : "#5C5F66",
+                      }}
+                    >
+                      {Math.round(v)}
+                    </div>
+                  ))}
+                  <div
+                    style={{
+                      width: 46,
+                      textAlign: "right",
+                      fontFamily: "'Roboto Mono', monospace",
+                      fontSize: 15,
+                      fontWeight: 700,
+                      color: sortKey === "overall" ? "#001E50" : "#5C5F66",
+                    }}
+                  >
+                    {Math.round(overall(p))}
+                  </div>
                 </div>
               ))}
             </div>
@@ -791,9 +881,10 @@ export default function App() {
           </div>
           <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
             {[
-              { key: "pct", label: "% victoires" },
+              { key: "pm", label: "+/- moyen" },
+              { key: "pct", label: "% vict." },
               { key: "wins", label: "Victoires" },
-              { key: "games", label: "Matchs joués" },
+              { key: "games", label: "Matchs" },
             ].map((s) => (
               <button
                 key={s.key}
@@ -852,30 +943,310 @@ export default function App() {
                         : ""}
                     </div>
                   </div>
-                  <div
-                    style={{
-                      fontSize: 15,
-                      fontWeight: 700,
-                      color: r.pct === null ? "#6B6C72" : "#001E50",
-                      fontVariantNumeric: "tabular-nums",
-                    }}
-                  >
-                    {r.pct === null ? "—" : `${Math.round(r.pct)} %`}
+                  <div style={{ textAlign: "right" }}>
+                    <div
+                      style={{
+                        fontSize: 15,
+                        fontWeight: 700,
+                        color:
+                          r.pmAvg === null ? "#6B6C72" : r.pmAvg >= 0 ? "#001E50" : "#B4000F",
+                        fontVariantNumeric: "tabular-nums",
+                      }}
+                    >
+                      {r.pmAvg === null
+                        ? "—"
+                        : `${r.pmAvg >= 0 ? "+" : ""}${r.pmAvg.toFixed(1)}`}
+                    </div>
+                    <div style={{ fontSize: 11, color: "#6B6C72", fontVariantNumeric: "tabular-nums" }}>
+                      {r.pct === null ? "" : `${Math.round(r.pct)} % vict.`}
+                    </div>
                   </div>
                 </div>
               ))}
             </div>
           )}
           <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 8 }}>
-            Le pourcentage compte un match nul comme un demi-succès, calculé sur les matchs
-            réellement joués. Attention aux petits échantillons : un joueur à 2 matchs peut
-            afficher 100 % sans que ce soit représentatif.
+            Le <strong>+/- moyen</strong> est l'écart de buts moyen des matchs joués, vu du côté du
+            joueur : il tient compte de l'ampleur des résultats, pas seulement du gagnant, ce qui en
+            fait un indicateur plus fidèle que le pourcentage de victoires. Le nul compte comme un
+            demi-succès dans ce pourcentage. Attention aux petits échantillons : les deux chiffres
+            sont très bruités en dessous d'une dizaine de matchs, et dépendent aussi des
+            coéquipiers.
           </div>
         </section>
       )}
 
       {tab === "seance" && (
         <>
+
+      {/* PANNEAU DE SCORE (remonté au-dessus de l'effectif) */}
+      <section style={{ padding: "14px 20px 4px" }}>
+        {teamA.length > 0 && (
+          <div>
+            <div
+              style={{
+                background: "#F4F5F8",
+                border: "1px solid #DDE0E6",
+                borderRadius: 10,
+                overflow: "hidden",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "stretch", padding: "14px 14px 8px" }}>
+                {[
+                  { label: "Équipe A", team: teamA, side: "A", color: "#001E50" },
+                  { label: "Équipe B", team: teamB, side: "B", color: "#B4000F" },
+                ].map(({ label, team, side, color }, i) => (
+                  <React.Fragment key={side}>
+                    {i === 1 && (
+                      <div
+                        style={{
+                          width: 46,
+                          display: "flex",
+                          alignItems: "center",
+                          justifyContent: "center",
+                          fontSize: 11,
+                          fontWeight: 800,
+                          color: "#B0B3BA",
+                        }}
+                      >
+                        VS
+                      </div>
+                    )}
+                    <div style={{ flex: 1, textAlign: i === 1 ? "right" : "left" }}>
+                      <div
+                        style={{
+                          fontSize: 10,
+                          fontWeight: 800,
+                          letterSpacing: "0.1em",
+                          textTransform: "uppercase",
+                          color: "#8A8D95",
+                        }}
+                      >
+                        {label}
+                      </div>
+                      <div
+                        style={{
+                          fontFamily: "'Roboto Mono', monospace",
+                          fontSize: 26,
+                          fontWeight: 700,
+                          color,
+                          lineHeight: 1.1,
+                        }}
+                      >
+                        {Math.round(team.reduce((s, p) => s + overall(p), 0))}
+                      </div>
+                    </div>
+                  </React.Fragment>
+                ))}
+              </div>
+              <div style={{ display: "flex", padding: "0 14px 12px", fontSize: 13 }}>
+                {[
+                  { team: teamA, side: "A" },
+                  { team: teamB, side: "B" },
+                ].map(({ team, side }, i) => (
+                  <div key={side} style={{ flex: 1, textAlign: i === 1 ? "right" : "left" }}>
+                    {team.map((p) => (
+                      <div
+                        key={p.id}
+                        onClick={() => clickSwap(p, side)}
+                        style={{
+                          padding: "4px 6px",
+                          borderRadius: 5,
+                          fontWeight: 600,
+                          color: "#3A3B41",
+                          background:
+                            selSwap && selSwap.player.id === p.id ? "#FBE1E2" : "transparent",
+                          cursor: "pointer",
+                        }}
+                      >
+                        {p.name}
+                      </div>
+                    ))}
+                  </div>
+                ))}
+              </div>
+              <div
+                style={{
+                  borderTop: "1px solid #DDE0E6",
+                  padding: "8px 14px",
+                  fontSize: 10.5,
+                  color: "#8A8D95",
+                  textAlign: "center",
+                }}
+              >
+                {options[optIdx]
+                  ? `écart d'équilibre ${Math.round(options[optIdx].diff)} pts · ${
+                      options[optIdx].repeats > 0
+                        ? "quelques binômes récents reconduits"
+                        : "aucun binôme récent reconduit"
+                    }`
+                  : "compo ajustée manuellement"}
+                {" · touche un joueur de chaque côté pour permuter"}
+              </div>
+            </div>
+
+            {options.length > 1 && (
+              <button
+                onClick={cycleOption}
+                style={{
+                  marginTop: 10,
+                  background: "none",
+                  border: "1px solid #001E50",
+                  color: "#001E50",
+                  borderRadius: 6,
+                  padding: "9px 12px",
+                  fontSize: 13,
+                  fontWeight: 600,
+                }}
+              >
+                Autre proposition ({optIdx + 1}/{options.length})
+              </button>
+            )}
+
+            <div style={{ marginTop: 14 }}>
+              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", marginBottom: 4 }}>
+                Résultat
+              </label>
+              <div style={{ display: "flex", gap: 6 }}>
+                {[
+                  { key: "A", label: "A gagne" },
+                  { key: "draw", label: "Nul" },
+                  { key: "B", label: "B gagne" },
+                ].map((o) => (
+                  <button
+                    key={o.key}
+                    onClick={() => {
+                      setWinner(o.key);
+                      if (o.key === "draw") setMarginInput("");
+                    }}
+                    style={{
+                      flex: 1,
+                      padding: "8px 6px",
+                      borderRadius: 6,
+                      border: winner === o.key ? "2px solid #001E50" : "1px solid #E1E3E8",
+                      background: winner === o.key ? "#E7ECF5" : "#FFFFFF",
+                      fontWeight: 600,
+                      fontSize: 13,
+                    }}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+
+              {winner && winner !== "draw" && (
+                <>
+                  <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
+                    Écart de buts
+                  </label>
+                  <input
+                    type="number"
+                    inputMode="numeric"
+                    min="1"
+                    value={marginInput}
+                    onChange={(e) => setMarginInput(e.target.value)}
+                    placeholder="ex: 6"
+                    style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 14 }}
+                  />
+                </>
+              )}
+              <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
+                Seuils actuels — petit ≤ {effectiveThresholds.small}, moyen ≤ {effectiveThresholds.medium}
+                {effectiveThresholds.n
+                  ? ` (terciles sur ${effectiveThresholds.n} match${effectiveThresholds.n > 1 ? "s" : ""})`
+                  : thresholdMode === "manual"
+                  ? " (réglage manuel)"
+                  : " (valeurs par défaut — encore trop peu de matchs pour calculer des terciles)"}
+              </div>
+
+              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "12px 0 4px" }}>
+                Gardien équipe A (optionnel)
+              </label>
+              <select
+                value={gkA}
+                onChange={(e) => setGkA(e.target.value)}
+                style={{ width: "100%", padding: "10px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
+              >
+                <option value="">Aucun / non renseigné</option>
+                {teamA.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+
+              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
+                Gardien équipe B (optionnel)
+              </label>
+              <select
+                value={gkB}
+                onChange={(e) => setGkB(e.target.value)}
+                style={{ width: "100%", padding: "10px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
+              >
+                <option value="">Aucun / non renseigné</option>
+                {teamB.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+              <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
+                Renseigner le gardien lui attribue une plus grande part du résultat défensif, et
+                épargne d'autant les joueurs de champ.
+              </div>
+
+              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "12px 0 4px" }}>
+                MVP offensif (optionnel)
+              </label>
+              <select
+                value={mvpOff}
+                onChange={(e) => setMvpOff(e.target.value)}
+                style={{ width: "100%", padding: "8px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
+              >
+                <option value="">Aucun</option>
+                {[...teamA, ...teamB].map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+
+              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
+                MVP défensif (optionnel)
+              </label>
+              <select
+                value={mvpDef}
+                onChange={(e) => setMvpDef(e.target.value)}
+                style={{ width: "100%", padding: "8px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
+              >
+                <option value="">Aucun</option>
+                {[...teamA, ...teamB].map((p) => (
+                  <option key={p.id} value={p.id}>
+                    {p.name}
+                  </option>
+                ))}
+              </select>
+
+              <button
+                onClick={saveResult}
+                style={{
+                  marginTop: 12,
+                  width: "100%",
+                  background: "#001E50",
+                  color: "#FFFFFF",
+                  border: "none",
+                  borderRadius: 6,
+                  padding: "10px 10px",
+                  fontWeight: 700,
+                  fontSize: 14,
+                }}
+              >
+                Enregistrer le résultat
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
 
       {/* ROSTER */}
       <section style={{ padding: "18px 20px" }}>
@@ -918,7 +1289,28 @@ export default function App() {
             Ajoute tes ~20 joueurs habituels. Chacun démarre à 1000 en attaque et en défense.
           </div>
         ) : (
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+          <div>
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+                padding: "0 2px 6px",
+                borderBottom: "1px solid #E4E6EA",
+                fontSize: 9.5,
+                fontWeight: 800,
+                letterSpacing: "0.06em",
+                textTransform: "uppercase",
+                color: "#A8ABB2",
+              }}
+            >
+              <span style={{ width: 26, flexShrink: 0 }} />
+              <span style={{ flex: 1 }}>Joueur</span>
+              <span style={{ width: 42, textAlign: "right" }}>Att</span>
+              <span style={{ width: 42, textAlign: "right" }}>Déf</span>
+              <span style={{ width: 46, textAlign: "right" }}>Note</span>
+              <span style={{ width: 14 }} />
+            </div>
             {leaderboard.map((p) => {
               const expanded = expandedPlayerId === p.id;
               const stats = expanded ? playerStats(p.name, matches) : null;
@@ -929,17 +1321,16 @@ export default function App() {
                       display: "flex",
                       alignItems: "center",
                       gap: 8,
-                      background: present.has(p.id) ? "#E7ECF5" : "#FFFFFF",
-                      border: "1px solid #E1E3E8",
-                      borderRadius: expanded ? "8px 8px 0 0" : 8,
-                      padding: "8px 10px",
+                      background: present.has(p.id) ? "#EBF0F9" : "transparent",
+                      borderBottom: "1px solid #F0F1F4",
+                      padding: "9px 2px",
                     }}
                   >
                     <input
                       type="checkbox"
                       checked={present.has(p.id)}
                       onChange={() => togglePresent(p.id)}
-                      style={{ width: 22, height: 22, margin: "4px 2px", flexShrink: 0 }}
+                      style={{ width: 22, height: 22, margin: "2px", flexShrink: 0 }}
                     />
                     {renamingId === p.id ? (
                       <>
@@ -991,16 +1382,58 @@ export default function App() {
                       <>
                     <div
                       onClick={() => setExpandedPlayerId(expanded ? null : p.id)}
-                      style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, cursor: "pointer" }}
+                      style={{ flex: 1, minWidth: 0, cursor: "pointer" }}
                     >
-                      <div style={{ flex: 1, fontSize: 14, fontWeight: 600 }}>{p.name}</div>
-                      <Badge tone="off">Att {Math.round(p.off)}</Badge>
-                      <Badge tone="def">Déf {Math.round(p.def)}</Badge>
-                      <Badge>{Math.round(overall(p))}</Badge>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: "#16171A" }}>{p.name}</div>
+                      {(() => {
+                        const form = recentForm(p.id, playerStats(p.name, matches).history);
+                        return (
+                          <div style={{ fontSize: 10, fontWeight: 600, color: "#A8ABB2", marginTop: 1 }}>
+                            ± {uncertainty(p)}
+                            {form !== null && Math.abs(form) >= 1
+                              ? ` · ${form > 0 ? "↑ +" : "↓ "}${Math.round(form)}`
+                              : ""}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    <div
+                      style={{
+                        width: 42,
+                        textAlign: "right",
+                        fontFamily: "'Roboto Mono', monospace",
+                        fontSize: 12.5,
+                        color: "#5C5F66",
+                      }}
+                    >
+                      {Math.round(p.off)}
+                    </div>
+                    <div
+                      style={{
+                        width: 42,
+                        textAlign: "right",
+                        fontFamily: "'Roboto Mono', monospace",
+                        fontSize: 12.5,
+                        color: "#5C5F66",
+                      }}
+                    >
+                      {Math.round(p.def)}
+                    </div>
+                    <div
+                      style={{
+                        width: 46,
+                        textAlign: "right",
+                        fontFamily: "'Roboto Mono', monospace",
+                        fontSize: 15,
+                        fontWeight: 700,
+                        color: "#001E50",
+                      }}
+                    >
+                      {Math.round(overall(p))}
                     </div>
                     <div
                       onClick={() => setExpandedPlayerId(expanded ? null : p.id)}
-                      style={{ color: "#6B6C72", fontSize: 13, padding: "6px 2px", cursor: "pointer" }}
+                      style={{ width: 14, color: "#A8ABB2", fontSize: 12, cursor: "pointer", textAlign: "right" }}
                       aria-label={`Détails de ${p.name}`}
                     >
                       {expanded ? "▾" : "▸"}
@@ -1060,6 +1493,31 @@ export default function App() {
                         <span>{stats.draws}N</span>
                         <span>{stats.losses}D</span>
                         <span style={{ color: "#6B6C72", fontWeight: 400 }}>· {p.games} match{p.games > 1 ? "s" : ""} au total</span>
+                      </div>
+                      <div style={{ color: "#6B6C72", marginBottom: 8 }}>
+                        Notes : attaque {Math.round(p.off)} · défense {Math.round(p.def)} ·{" "}
+                        <strong style={{ color: "#001E50" }}>combiné {Math.round(overall(p))}</strong>{" "}
+                        (± {uncertainty(p)})
+                        {(() => {
+                          const form = recentForm(p.id, stats.history);
+                          if (form === null || Math.abs(form) < 1) return null;
+                          return (
+                            <>
+                              {" · forme "}
+                              <strong style={{ color: form > 0 ? "#001E50" : "#B4000F" }}>
+                                {form > 0 ? `↑ +${Math.round(form)}` : `↓ ${Math.round(form)}`}
+                              </strong>
+                            </>
+                          );
+                        })()}
+                      </div>
+                      <div style={{ color: "#6B6C72", marginBottom: 8 }}>
+                        +/- moyen :{" "}
+                        {stats.history.length === 0
+                          ? "—"
+                          : `${stats.pm / stats.history.length >= 0 ? "+" : ""}${(
+                              stats.pm / stats.history.length
+                            ).toFixed(1)} but${Math.abs(stats.pm / stats.history.length) >= 2 ? "s" : ""} par match`}
                       </div>
                       <div style={{ color: "#6B6C72", marginBottom: 8 }}>
                         Présence :{" "}
@@ -1224,174 +1682,6 @@ export default function App() {
           Générer les équipes équilibrées
         </button>
 
-        {teamA.length > 0 && (
-          <div style={{ marginTop: 14 }}>
-            <div style={{ display: "flex", gap: 10 }}>
-              {[
-                { label: "Équipe A", team: teamA, side: "A" },
-                { label: "Équipe B", team: teamB, side: "B" },
-              ].map(({ label, team, side }) => {
-                const sum = team.reduce((s, p) => s + overall(p), 0);
-                return (
-                  <div key={side} style={{ flex: 1, background: "#FFFFFF", border: "1px solid #E1E3E8", borderRadius: 8, padding: 10 }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: "#6B6C72", marginBottom: 6 }}>
-                      {label} · {Math.round(sum)}
-                    </div>
-                    {team.map((p) => (
-                      <div
-                        key={p.id}
-                        onClick={() => clickSwap(p, side)}
-                        style={{
-                          padding: "6px 6px",
-                          borderRadius: 5,
-                          fontSize: 13,
-                          marginBottom: 3,
-                          background: selSwap && selSwap.player.id === p.id ? "#FBE1E2" : "transparent",
-                        }}
-                      >
-                        {p.name}
-                      </div>
-                    ))}
-                  </div>
-                );
-              })}
-            </div>
-            <div style={{ fontSize: 11, color: "#6B6C72", marginTop: 6 }}>
-              Touche un joueur de chaque équipe pour permuter leurs places.
-              {options[optIdx]
-                ? ` Écart d'équilibre ${Math.round(options[optIdx].diff)} pts · ${
-                    options[optIdx].repeats > 0
-                      ? "quelques binômes des dernières semaines reconduits"
-                      : "aucun binôme récent reconduit"
-                  }.`
-                : ""}
-            </div>
-
-            {options.length > 1 && (
-              <button
-                onClick={cycleOption}
-                style={{
-                  marginTop: 8,
-                  background: "none",
-                  border: "1px solid #001E50",
-                  color: "#001E50",
-                  borderRadius: 6,
-                  padding: "7px 12px",
-                  fontSize: 13,
-                  fontWeight: 600,
-                }}
-              >
-                Autre proposition ({optIdx + 1}/{options.length})
-              </button>
-            )}
-
-            <div style={{ marginTop: 14 }}>
-              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", marginBottom: 4 }}>
-                Résultat
-              </label>
-              <div style={{ display: "flex", gap: 6 }}>
-                {[
-                  { key: "A", label: "A gagne" },
-                  { key: "draw", label: "Nul" },
-                  { key: "B", label: "B gagne" },
-                ].map((o) => (
-                  <button
-                    key={o.key}
-                    onClick={() => {
-                      setWinner(o.key);
-                      if (o.key === "draw") setMarginInput("");
-                    }}
-                    style={{
-                      flex: 1,
-                      padding: "8px 6px",
-                      borderRadius: 6,
-                      border: winner === o.key ? "2px solid #001E50" : "1px solid #E1E3E8",
-                      background: winner === o.key ? "#E7ECF5" : "#FFFFFF",
-                      fontWeight: 600,
-                      fontSize: 13,
-                    }}
-                  >
-                    {o.label}
-                  </button>
-                ))}
-              </div>
-
-              {winner && winner !== "draw" && (
-                <>
-                  <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
-                    Écart de buts
-                  </label>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min="1"
-                    value={marginInput}
-                    onChange={(e) => setMarginInput(e.target.value)}
-                    placeholder="ex: 6"
-                    style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 14 }}
-                  />
-                </>
-              )}
-              <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
-                Seuils actuels — petit ≤ {effectiveThresholds.small}, moyen ≤ {effectiveThresholds.medium}
-                {effectiveThresholds.n
-                  ? ` (terciles sur ${effectiveThresholds.n} match${effectiveThresholds.n > 1 ? "s" : ""})`
-                  : thresholdMode === "manual"
-                  ? " (réglage manuel)"
-                  : " (valeurs par défaut — encore trop peu de matchs pour calculer des terciles)"}
-              </div>
-
-              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "12px 0 4px" }}>
-                MVP offensif (optionnel)
-              </label>
-              <select
-                value={mvpOff}
-                onChange={(e) => setMvpOff(e.target.value)}
-                style={{ width: "100%", padding: "8px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
-              >
-                <option value="">Aucun</option>
-                {[...teamA, ...teamB].map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-
-              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
-                MVP défensif (optionnel)
-              </label>
-              <select
-                value={mvpDef}
-                onChange={(e) => setMvpDef(e.target.value)}
-                style={{ width: "100%", padding: "8px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
-              >
-                <option value="">Aucun</option>
-                {[...teamA, ...teamB].map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-
-              <button
-                onClick={saveResult}
-                style={{
-                  marginTop: 12,
-                  width: "100%",
-                  background: "#001E50",
-                  color: "#FFFFFF",
-                  border: "none",
-                  borderRadius: 6,
-                  padding: "10px 10px",
-                  fontWeight: 700,
-                  fontSize: 14,
-                }}
-              >
-                Enregistrer le résultat
-              </button>
-            </div>
-          </div>
-        )}
       </section>
 
       {/* BACKUP */}
@@ -1574,6 +1864,9 @@ export default function App() {
                     : `Écart ${Math.abs(m.diff)} (${m.tier === "small" ? "petit" : m.tier === "medium" ? "moyen" : "large"})`}
                   {m.mvpOffName ? ` · MVP att. ${m.mvpOffName}` : ""}
                   {m.mvpDefName ? ` · MVP déf. ${m.mvpDefName}` : ""}
+                  {m.gkAName || m.gkBName
+                    ? ` · gardiens ${m.gkAName || "?"} / ${m.gkBName || "?"}`
+                    : ""}
                 </div>
               </div>
             ))}
