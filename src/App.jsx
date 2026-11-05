@@ -10,10 +10,28 @@ const K_SCALE = 8; // nombre de matchs sur lequel le K se resserre
 const kFor = (p) => K_MIN + (K_MAX - K_MIN) / (1 + (p.games || 0) / K_SCALE);
 const START = 1000;
 
-const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const expected = (diff) => 1 / (1 + Math.pow(10, -diff / 400));
-const overall = (p) => (p.off + p.def) / 2;
+// Une seule note par joueur. Les anciennes données portaient une note
+// d'attaque et une de défense : on prend leur moyenne pour la reprise.
+const overall = (p) =>
+  Number.isFinite(p.rating) ? p.rating : ((p.off ?? START) + (p.def ?? START)) / 2;
 const isActive = (p) => p.active !== false;
+
+// Poids de l'ampleur de la victoire, en continu plutôt qu'en paliers. Un
+// découpage en trois tranches rendait le résultat très sensible à la
+// position des frontières : avec les écarts réellement observés, une
+// victoire à 5 buts pouvait valoir ×1 ou ×1,6 selon le réglage. La forme
+// logarithmique supprime cet effet de seuil et exploite tout le score.
+// C = 2,2 a été calibré pour conserver la vitesse moyenne de l'ancien
+// système sur l'historique existant. Un nul ou une victoire d'un but
+// valent 1 : au-delà, l'ampleur compte, avec un rendement décroissant.
+const MARGIN_C = 2.2;
+const MARGIN_CAP = 2.5;
+const marginMult = (diff) => {
+  const d = Math.abs(diff);
+  if (d <= 1) return 1;
+  return Math.min(MARGIN_CAP, 1 + Math.log(d) / MARGIN_C);
+};
 
 function playerStats(name, matches) {
   let wins = 0,
@@ -44,8 +62,36 @@ function playerStats(name, matches) {
     if (m.mvpDefName === name) mvpDef++;
     history.push({ ...m, result });
   }
-  return { wins, draws, losses, mvpOff, mvpDef, pm, history };
+  // Séries de victoires. history va du plus récent au plus ancien, donc on
+  // le parcourt à l'envers pour suivre le fil du temps. Un nul casse la
+  // série au même titre qu'une défaite : une série, ce sont des victoires.
+  let bestStreak = 0,
+    run = 0;
+  for (let i = history.length - 1; i >= 0; i--) {
+    if (history[i].result === "Victoire") {
+      run += 1;
+      if (run > bestStreak) bestStreak = run;
+    } else run = 0;
+  }
+  let currentStreak = 0;
+  for (const m of history) {
+    if (m.result === "Victoire") currentStreak += 1;
+    else break;
+  }
+  return { wins, draws, losses, mvpOff, mvpDef, pm, history, bestStreak, currentStreak };
 }
+
+// Paliers façon Unreal Tournament, transposés au futsal : enchaîner 5
+// victoires y est déjà rare, là où le jeu demandait 25 frags pour Godlike.
+const STREAK_TIERS = [
+  { n: 10, label: "Wicked Sick" },
+  { n: 8, label: "Godlike" },
+  { n: 6, label: "Unstoppable" },
+  { n: 5, label: "Dominating" },
+  { n: 4, label: "Rampage" },
+  { n: 3, label: "Killing Spree" },
+];
+const streakTier = (n) => STREAK_TIERS.find((t) => n >= t.n) || null;
 
 // Incertitude affichée à côté de la note : large pour un nouveau, resserrée
 // avec l'expérience. Traduit visuellement ce que fait le K adaptatif.
@@ -57,14 +103,252 @@ function recentForm(playerId, history, window = 5) {
   const snaps = [];
   for (const m of history) {
     const r = m.ratingsAfter && m.ratingsAfter[playerId];
-    if (r) snaps.push((r.off + r.def) / 2);
+    if (r) snaps.push(Number.isFinite(r.rating) ? r.rating : (r.off + r.def) / 2);
     if (snaps.length > window) break;
   }
   if (snaps.length < 2) return null;
   // history est du plus récent au plus ancien
   return snaps[0] - snaps[snaps.length - 1];
 }
+// ---- Statistiques de paires (duos et rivalités) ----
+// Avec 20 joueurs dont 10 par séance, deux joueurs donnés ne sont dans la
+// même équipe qu'un match sur dix environ : après 20 séances une paire n'a
+// joué ensemble que 2 fois en moyenne. Un simple « plus de victoires »
+// sacrerait donc la paire la plus chanceuse. D'où deux garde-fous : un
+// minimum de matchs pour apparaître, et un lissage vers 50 % qui fait qu'une
+// paire à 3/3 reste au coude à coude avec une paire à 9/12 au lieu de
+// l'écraser, et une paire à 2 matchs n'apparaît pas du tout.
+const PAIR_MIN = 3; // matchs ensemble avant d'entrer au classement
+const PAIR_PRIOR = 4; // force du lissage vers 50 %
+const TIGHT_MIN = 5; // confrontations avant de parler de « rivalité serrée »
+const smoothedRate = (w, d, n) => (w + 0.5 * d + PAIR_PRIOR * 0.5) / (n + PAIR_PRIOR);
+
+// `activeNames` : un Set des noms encore à l'effectif. Les joueurs archivés
+// (et ceux supprimés dont le nom traîne encore dans l'historique) sont
+// écartés de toutes ces statistiques, pour que les podiums ne soient pas
+// trustés par des paires qui ne rejoueront jamais.
+function pairStats(matches, activeNames = null) {
+  const mates = new Map(); // coéquipiers
+  const foes = new Map(); // adversaires
+  const keep = (n) => !activeNames || activeNames.has(n);
+  const get = (map, key, init) => {
+    if (!map.has(key)) map.set(key, init());
+    return map.get(key);
+  };
+
+  for (const m of matches) {
+    if (!Array.isArray(m.teamA) || !Array.isArray(m.teamB)) continue;
+    const diff = Number.isFinite(m.diff) ? m.diff : 0;
+
+    // Coéquipiers : toutes les paires à l'intérieur de chaque équipe.
+    for (const [fullTeam, res, pm] of [
+      [m.teamA, m.outcome === "draw" ? "d" : m.outcome === "A" ? "w" : "l", diff],
+      [m.teamB, m.outcome === "draw" ? "d" : m.outcome === "B" ? "w" : "l", -diff],
+    ]) {
+      const team = fullTeam.filter(keep);
+      for (let i = 0; i < team.length; i++) {
+        for (let j = i + 1; j < team.length; j++) {
+          const [n1, n2] = [team[i], team[j]].sort();
+          const e = get(mates, `${n1}||${n2}`, () => ({
+            a: n1,
+            b: n2,
+            w: 0,
+            d: 0,
+            l: 0,
+            pm: 0,
+            gf: 0, // buts marqués par leur équipe
+            ga: 0, // buts encaissés
+            nScored: 0, // matchs où le score détaillé est connu
+          }));
+          e[res] += 1;
+          e.pm += pm;
+          if (Number.isFinite(m.goalsA) && Number.isFinite(m.goalsB)) {
+            const isA = fullTeam === m.teamA;
+            e.gf += isA ? m.goalsA : m.goalsB;
+            e.ga += isA ? m.goalsB : m.goalsA;
+            e.nScored += 1;
+          }
+        }
+      }
+    }
+
+    // Adversaires : toutes les paires à cheval sur les deux équipes.
+    for (const pa of m.teamA.filter(keep)) {
+      for (const pb of m.teamB.filter(keep)) {
+        const [n1, n2] = [pa, pb].sort();
+        const e = get(foes, `${n1}||${n2}`, () => ({
+          a: n1,
+          b: n2,
+          aWins: 0,
+          bWins: 0,
+          draws: 0,
+        }));
+        if (m.outcome === "draw") e.draws += 1;
+        else {
+          // n1 est-il du côté vainqueur ?
+          const n1OnA = n1 === pa;
+          const n1Won = (m.outcome === "A") === n1OnA;
+          if (n1Won) e.aWins += 1;
+          else e.bWins += 1;
+        }
+      }
+    }
+  }
+
+  // Duos : classés par taux de victoire lissé.
+  const duos = [...mates.values()]
+    .map((e) => {
+      const n = e.w + e.d + e.l;
+      return { ...e, n, rate: n === 0 ? 0 : (e.w + 0.5 * e.d) / n, score: smoothedRate(e.w, e.d, n) };
+    })
+    .filter((e) => e.n >= PAIR_MIN);
+
+  // Rivalités : on retient le point de vue de celui qui perd le plus.
+  const rivalries = [...foes.values()]
+    .map((e) => {
+      const n = e.aWins + e.bWins + e.draws;
+      const aIsVictim = e.aWins <= e.bWins;
+      const victim = aIsVictim ? e.a : e.b;
+      const nemesis = aIsVictim ? e.b : e.a;
+      const vWins = Math.min(e.aWins, e.bWins);
+      const nWins = Math.max(e.aWins, e.bWins);
+      return {
+        victim,
+        nemesis,
+        vWins,
+        nWins,
+        draws: e.draws,
+        n,
+        // taux de défaite lissé de la victime face à sa bête noire
+        score: smoothedRate(nWins, e.draws, n),
+      };
+    })
+    .filter((e) => e.n >= PAIR_MIN);
+
+  const frequentDuos = [...mates.values()]
+    .map((e) => ({ ...e, n: e.w + e.d + e.l }))
+    .sort((x, y) => y.n - x.n);
+
+  // Duos les plus prolifiques : buts marqués en moyenne quand ils sont
+  // ensemble. Ne compte que les matchs dont le score détaillé est connu.
+  const explosive = [...mates.values()]
+    .filter((e) => e.nScored >= PAIR_MIN)
+    .map((e) => ({ ...e, n: e.w + e.d + e.l, gfAvg: e.gf / e.nScored, gaAvg: e.ga / e.nScored }))
+    .sort((x, y) => y.gfAvg - x.gfAvg || y.nScored - x.nScored);
+
+  // Rivalités les plus serrées : il faut plus de confrontations que pour un
+  // podium, sinon un 1-1 ressort comme le duel du siècle.
+  const tightest = [...foes.values()]
+    .map((e) => {
+      const n = e.aWins + e.bWins + e.draws;
+      const rate = n === 0 ? 0.5 : (e.aWins + 0.5 * e.draws) / n;
+      return { ...e, n, rate, gap: Math.abs(rate - 0.5) };
+    })
+    .filter((e) => e.n >= TIGHT_MIN)
+    .sort((x, y) => x.gap - y.gap || y.n - x.n);
+
+  return { duos, rivalries, frequentDuos, explosive, tightest, mates, foes };
+}
+
+// Vue personnelle : le coéquipier avec qui un joueur gagne le plus, et
+// l'adversaire contre qui il perd le plus. Seuil plus bas que les podiums
+// généraux, parce qu'on ne compare qu'au sein des paires d'un seul joueur.
+const SOLO_MIN = 2;
+function playerAffinities(name, mates, foes) {
+  let bestAlly = null;
+  for (const e of mates.values()) {
+    if (e.a !== name && e.b !== name) continue;
+    const n = e.w + e.d + e.l;
+    if (n < SOLO_MIN) continue;
+    const score = smoothedRate(e.w, e.d, n);
+    if (!bestAlly || score > bestAlly.score) {
+      bestAlly = { who: e.a === name ? e.b : e.a, w: e.w, d: e.d, l: e.l, n, score };
+    }
+  }
+  let worstFoe = null;
+  for (const e of foes.values()) {
+    if (e.a !== name && e.b !== name) continue;
+    const n = e.aWins + e.bWins + e.draws;
+    if (n < SOLO_MIN) continue;
+    const isA = e.a === name;
+    const mine = isA ? e.aWins : e.bWins;
+    const theirs = isA ? e.bWins : e.aWins;
+    const score = smoothedRate(theirs, e.draws, n);
+    if (!worstFoe || score > worstFoe.score) {
+      worstFoe = {
+        who: isA ? e.b : e.a,
+        wins: mine,
+        losses: theirs,
+        draws: e.draws,
+        n,
+        score,
+      };
+    }
+  }
+  // Un allié qui ne fait pas gagner plus souvent qu'il ne fait perdre n'est
+  // pas un allié, et un adversaire à 2V-2D n'est pas une bête noire : on
+  // n'affiche que les bilans réellement marqués.
+  if (bestAlly && bestAlly.w <= bestAlly.l) bestAlly = null;
+  if (worstFoe && worstFoe.losses <= worstFoe.wins) worstFoe = null;
+  return { bestAlly, worstFoe };
+}
+
 const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+// Rejoue tout l'historique depuis zéro. Indispensable dès qu'on touche à un
+// match passé : son résultat change les notes qui suivent, donc celles de
+// tous les matchs postérieurs. L'état de notation est tenu par NOM et non
+// par identifiant, pour que les joueurs supprimés de l'effectif pèsent
+// quand même dans les moyennes d'équipe des matchs où ils jouaient — sans
+// quoi on recalculerait des matchs avec des équipes incomplètes.
+// Avec une marge continue, le résultat ne dépend plus d'un palier stocké :
+// rejouer l'historique redonne exactement les mêmes notes.
+function replayHistory(players, matches) {
+  const chrono = [...matches].reverse(); // du plus ancien au plus récent
+  const nameToId = new Map(players.map((p) => [p.name, p.id]));
+  const state = new Map();
+  const st = (name) => {
+    if (!state.has(name)) state.set(name, { name, rating: START, games: 0 });
+    return state.get(name);
+  };
+
+  const rebuilt = chrono.map((m) => {
+    if (!Array.isArray(m.teamA) || !Array.isArray(m.teamB) || !m.teamA.length || !m.teamB.length) {
+      return m;
+    }
+    const diff = Number.isFinite(m.diff) ? m.diff : 0;
+    const outcome = diff > 0 ? "A" : diff < 0 ? "B" : "draw";
+
+    const teamA = m.teamA.map(st);
+    const teamB = m.teamB.map(st);
+    const { M, errA, errB } = computeErrorsFromOutcome(teamA, teamB, outcome, diff);
+
+    const ratingsAfter = {};
+    for (const [team, err] of [
+      [teamA, errA],
+      [teamB, errB],
+    ]) {
+      for (const p of team) {
+        p.rating += kFor(p) * M * err;
+        p.games += 1;
+        if (p.name === m.mvpOffName) p.rating += MVP_BONUS;
+        if (p.name === m.mvpDefName) p.rating += MVP_BONUS;
+        const id = nameToId.get(p.name);
+        if (id) ratingsAfter[id] = { rating: p.rating };
+      }
+    }
+    return { ...m, outcome, ratingsAfter };
+  });
+
+  const nextPlayers = players.map((p) => {
+    const s = state.get(p.name);
+    return s
+      ? { ...p, rating: s.rating, games: s.games }
+      : { ...p, rating: START, games: 0 };
+  });
+
+  return { players: nextPlayers, matches: rebuilt.reverse() };
+}
 
 function combos(arr, k) {
   const res = [];
@@ -140,12 +424,7 @@ function bestSplits(players, pairWeights = new Map()) {
     const teamB = restIdx.map((i) => players[i]);
     const sumA = teamA.reduce((s, p) => s + overall(p), 0);
     const sumB = teamB.reduce((s, p) => s + overall(p), 0);
-    const offA = teamA.reduce((s, p) => s + p.off, 0);
-    const offB = teamB.reduce((s, p) => s + p.off, 0);
-    const defA = teamA.reduce((s, p) => s + p.def, 0);
-    const defB = teamB.reduce((s, p) => s + p.def, 0);
-    const balance =
-      Math.abs(sumA - sumB) + 0.3 * Math.abs(offA - offB) + 0.3 * Math.abs(defA - defB);
+    const balance = Math.abs(sumA - sumB);
     const repeats = repeatCost(teamA) + repeatCost(teamB);
     const score = balance + VARIETY_WEIGHT * repeats;
     options.push({ teamA, teamB, diff: balance, repeats, score, sumA, sumB });
@@ -154,61 +433,24 @@ function bestSplits(players, pairWeights = new Map()) {
   return options.slice(0, 5);
 }
 
-const TIER_MULT = { small: 1, medium: 1.6, large: 2.3 };
-// Poids du vote MVP. C'est la seule source d'information qui distingue
-// réellement l'attaque de la défense (le résultat du match, lui, s'applique
-// identiquement aux deux). Testé par simulation : 30 sépare bien les deux
-// notes sans dégrader le classement combiné ; au-delà, plus de gain.
-const MVP_BONUS = 30;
-const DEFAULT_THRESHOLDS = { small: 2, medium: 5 }; // repères de départ, avant d'avoir assez de matchs
+// Poids du vote MVP, ajouté à la note du joueur élu. Avec une note unique,
+// être élu meilleur attaquant ET meilleur défenseur cumule les deux bonus.
+// 15 représente un peu moins d'un résultat de match type : assez pour
+// récompenser une grosse soirée, pas assez pour écraser le résultat.
+const MVP_BONUS = 15;
 
-// Seuils suggérés par terciles à partir des écarts de buts déjà enregistrés
-// (hors matchs nuls). Renvoie null tant qu'il n'y a pas assez de matchs.
-function autoThresholds(matches) {
-  const diffs = matches
-    .map((m) => Math.abs(m.diff))
-    .filter((d) => Number.isFinite(d) && d > 0)
-    .sort((a, b) => a - b);
-  if (diffs.length < 6) return null;
-  const pick = (p) => diffs[Math.min(diffs.length - 1, Math.floor(p * diffs.length))];
-  return { small: pick(1 / 3), medium: pick(2 / 3), n: diffs.length };
-}
-
-// Pondération du gardien. En futsal il détermine une grande part des buts
-// encaissés : il absorbe donc plus du signal défensif, et les joueurs de
-// champ en sont d'autant épargnés. À l'inverse il pèse peu en attaque.
-// Les poids sont normalisés pour que le total par équipe reste constant.
-const GK_DEF_WEIGHT = 2;
-const GK_OFF_WEIGHT = 0.5;
-const gkWeights = (teamSize, isKeeper, hasKeeper) => {
-  if (!hasKeeper || teamSize < 2) return { off: 1, def: 1 };
-  if (isKeeper) return { off: GK_OFF_WEIGHT, def: GK_DEF_WEIGHT };
-  return {
-    off: (teamSize - GK_OFF_WEIGHT) / (teamSize - 1),
-    def: (teamSize - GK_DEF_WEIGHT) / (teamSize - 1),
-  };
-};
-
-// Renvoie les termes d'erreur (performance observée − attendue) par équipe.
-// Le delta de chaque joueur est ensuite errX × son K personnel × le
-// multiplicateur d'écart, ce qui laisse les nouveaux bouger plus vite.
-function computeErrorsFromOutcome(teamA, teamB, outcome, tier) {
-  const avg = (arr, key) => arr.reduce((s, p) => s + p[key], 0) / arr.length;
-  const offA = avg(teamA, "off"),
-    defA = avg(teamA, "def"),
-    offB = avg(teamB, "off"),
-    defB = avg(teamB, "def");
-  const M = outcome === "draw" ? 1 : TIER_MULT[tier] || 1;
+// Renvoie le multiplicateur d'ampleur et l'erreur de chaque équipe
+// (performance observée − attendue). Le delta d'un joueur vaut ensuite
+// err × son K personnel × ce multiplicateur.
+function computeErrorsFromOutcome(teamA, teamB, outcome, diff) {
+  const avg = (arr) => arr.reduce((s, p) => s + overall(p), 0) / arr.length;
+  const rA = avg(teamA),
+    rB = avg(teamB);
+  const M = marginMult(diff);
   const sA = outcome === "A" ? 1 : outcome === "draw" ? 0.5 : 0;
   const sB = 1 - sA;
 
-  return {
-    M,
-    errOffA: sA - expected(offA - defB),
-    errDefA: sA - expected(defA - offB),
-    errOffB: sB - expected(offB - defA),
-    errDefB: sB - expected(defB - offA),
-  };
+  return { M, errA: sA - expected(rA - rB), errB: sB - expected(rB - rA) };
 }
 
 // Petite courbe de progression (attaque en rouge, défense en bleu) tracée à
@@ -272,42 +514,58 @@ export default function App() {
   const [teamA, setTeamA] = useState([]);
   const [teamB, setTeamB] = useState([]);
   const [selSwap, setSelSwap] = useState(null);
-  const [winner, setWinner] = useState(null); // "A" | "draw" | "B"
-  const [marginInput, setMarginInput] = useState("");
+  const [scoreA, setScoreA] = useState("");
+  const [scoreB, setScoreB] = useState("");
   const [mvpOff, setMvpOff] = useState("");
   const [mvpDef, setMvpDef] = useState("");
-  const [gkA, setGkA] = useState("");
-  const [gkB, setGkB] = useState("");
   const [showHistory, setShowHistory] = useState(false);
   const [showArchived, setShowArchived] = useState(false);
-  const [showSettings, setShowSettings] = useState(false);
-  const [thresholdMode, setThresholdMode] = useState("auto"); // "auto" | "manual"
-  const [manualSmall, setManualSmall] = useState(2);
-  const [manualMedium, setManualMedium] = useState(5);
   const [expandedPlayerId, setExpandedPlayerId] = useState(null);
   const [undo, setUndo] = useState(null);
   const [renamingId, setRenamingId] = useState(null);
   const [renameValue, setRenameValue] = useState("");
   const [tab, setTab] = useState("seance"); // "seance" | "classement"
-  const [sortKey, setSortKey] = useState("overall"); // "off" | "def" | "overall"
-  const [recordSort, setRecordSort] = useState("pm"); // "pm" | "pct" | "wins" | "games"
+  const [recordSort, setRecordSort] = useState("wins"); // "wins" | "streak" | "pm" | "pct" | "games"
+  const [affView, setAffView] = useState("best"); // "best" | "worst" | "nemesis"
+  const [editingId, setEditingId] = useState(null); // match en cours de correction
+  const [editMode, setEditMode] = useState("score"); // "score" | "margin"
+  const [editA, setEditA] = useState("");
+  const [editB, setEditB] = useState("");
+  const [editMargin, setEditMargin] = useState("");
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
 
   useEffect(() => {
     (async () => {
       try {
         const p = await storage.get("futsal-players").catch(() => null);
         const m = await storage.get("futsal-matches").catch(() => null);
-        const t = await storage.get("futsal-thresholds").catch(() => null);
         const u = await storage.get("futsal-undo").catch(() => null);
-        if (p) setPlayers(JSON.parse(p.value));
-        if (m) setMatches(JSON.parse(m.value));
-        if (t) {
-          const cfg = JSON.parse(t.value);
-          setThresholdMode(cfg.mode || "auto");
-          setManualSmall(cfg.small ?? 2);
-          setManualMedium(cfg.medium ?? 5);
+        let loadedPlayers = p ? JSON.parse(p.value) : [];
+        let loadedMatches = m ? JSON.parse(m.value) : [];
+
+        // Reprise des données d'avant la note unique : les joueurs portaient
+        // une note d'attaque et une de défense, calculées par paliers
+        // d'écart. On rejoue tout l'historique sous le nouveau modèle pour
+        // repartir d'un classement cohérent, puis on l'enregistre.
+        const needsMigration =
+          loadedPlayers.length > 0 && loadedPlayers.some((x) => !Number.isFinite(x.rating));
+        if (needsMigration) {
+          const r = replayHistory(loadedPlayers, loadedMatches);
+          loadedPlayers = r.players.map(({ off, def, ...rest }) => rest);
+          loadedMatches = r.matches;
+          await window.storage
+            .set("futsal-players", JSON.stringify(loadedPlayers), true)
+            .catch(() => {});
+          await window.storage
+            .set("futsal-matches", JSON.stringify(loadedMatches), true)
+            .catch(() => {});
+          setNotice(
+            "Classement recalculé : une note unique par joueur, et l'ampleur des victoires compte désormais en continu."
+          );
         }
+        setPlayers(loadedPlayers);
+        setMatches(loadedMatches);
         if (u) {
           const snap = JSON.parse(u.value);
           if (snap && Array.isArray(snap.players)) setUndo(snap);
@@ -336,16 +594,6 @@ export default function App() {
       setError("Échec de la sauvegarde de l'historique.");
     }
   };
-  const persistThresholds = async (mode, small, medium) => {
-    setThresholdMode(mode);
-    setManualSmall(small);
-    setManualMedium(medium);
-    try {
-      await storage.set("futsal-thresholds", JSON.stringify({ mode, small, medium }));
-    } catch (e) {
-      setError("Échec de la sauvegarde des seuils.");
-    }
-  };
 
   const persistUndo = async (snap) => {
     setUndo(snap);
@@ -363,7 +611,6 @@ export default function App() {
       exportedAt: new Date().toISOString(),
       players,
       matches,
-      thresholds: { mode: thresholdMode, small: manualSmall, medium: manualMedium },
     };
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
@@ -396,9 +643,6 @@ export default function App() {
           return;
         persistPlayers(data.players);
         persistMatches(data.matches);
-        if (data.thresholds) {
-          persistThresholds(data.thresholds.mode || "auto", data.thresholds.small ?? 2, data.thresholds.medium ?? 5);
-        }
         setError("");
       } catch (err) {
         setError("Impossible de lire ce fichier (JSON invalide).");
@@ -408,15 +652,105 @@ export default function App() {
     e.target.value = "";
   };
 
-  const undoLastMatch = () => {
-    if (!undo || !Array.isArray(undo.players) || matches.length === 0) {
+  // Une seule pile d'annulation pour les deux cas : enregistrement d'un
+  // match et correction de l'historique. Le snapshot porte l'effectif ET la
+  // liste des matchs, donc restaurer revient à remettre les deux en place.
+  const undoLast = () => {
+    if (!undo || !Array.isArray(undo.players) || !Array.isArray(undo.matches)) {
       setError("Rien à annuler.");
       return;
     }
     setError("");
     persistPlayers(undo.players);
-    persistMatches(matches.slice(1));
+    persistMatches(undo.matches);
     persistUndo(null);
+    closeEditor();
+  };
+
+  const openEditor = (m) => {
+    setEditingId(m.id);
+    const known = Number.isFinite(m.goalsA) && Number.isFinite(m.goalsB);
+    setEditMode(known ? "score" : "margin");
+    setEditA(known ? String(m.goalsA) : "");
+    setEditB(known ? String(m.goalsB) : "");
+    setEditMargin(Number.isFinite(m.diff) ? String(m.diff) : "");
+    setError("");
+  };
+
+  const closeEditor = () => {
+    setEditingId(null);
+    setEditA("");
+    setEditB("");
+    setEditMargin("");
+  };
+
+  // Applique une liste de matchs modifiée : on rejoue tout l'historique pour
+  // que les notes redeviennent cohérentes, et on garde de quoi annuler.
+  const applyHistoryChange = (nextMatches) => {
+    const replayed = replayHistory(players, nextMatches);
+    persistUndo({ players, matches, savedAt: new Date().toISOString(), kind: "edit" });
+    persistPlayers(replayed.players);
+    persistMatches(replayed.matches);
+    closeEditor();
+  };
+
+  const saveMatchEdit = (m) => {
+    let goalsA, goalsB, diff;
+    if (editMode === "score") {
+      const gA = Number(editA);
+      const gB = Number(editB);
+      if (
+        editA.trim() === "" ||
+        editB.trim() === "" ||
+        !Number.isFinite(gA) ||
+        !Number.isFinite(gB) ||
+        gA < 0 ||
+        gB < 0
+      ) {
+        setError("Entre le score des deux équipes (deux nombres positifs ou zéro).");
+        return;
+      }
+      goalsA = gA;
+      goalsB = gB;
+      diff = gA - gB;
+    } else {
+      const d = Number(editMargin);
+      if (editMargin.trim() === "" || !Number.isFinite(d)) {
+        setError("Entre un écart valide (positif si A gagne, négatif si B gagne, 0 si nul).");
+        return;
+      }
+      // Mode écart seul : on retire le score détaillé plutôt que d'inventer
+      // des buts, sinon les duos explosifs seraient calculés sur du vide.
+      goalsA = undefined;
+      goalsB = undefined;
+      diff = d;
+    }
+    setError("");
+    const updated = { ...m, goalsA, goalsB, diff };
+    if (goalsA === undefined) {
+      delete updated.goalsA;
+      delete updated.goalsB;
+    }
+    // On efface le palier pour qu'il soit réévalué avec le nouvel écart ;
+    // tous les autres matchs gardent le leur et sont rejoués à l'identique.
+    delete updated.tier;
+    applyHistoryChange(matches.map((x) => (x.id === m.id ? updated : x)));
+  };
+
+  const deleteMatch = (m) => {
+    const when = new Date(m.date).toLocaleDateString("fr-FR", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+    });
+    if (
+      !window.confirm(
+        `Supprimer le match du ${when} ? Toutes les notes seront recalculées sans lui. L'action reste annulable juste après.`
+      )
+    )
+      return;
+    setError("");
+    applyHistoryChange(matches.filter((x) => x.id !== m.id));
   };
 
   const renamePlayer = (id, rawName) => {
@@ -514,8 +848,8 @@ export default function App() {
     setOptIdx(0);
     setTeamA(opts[0].teamA);
     setTeamB(opts[0].teamB);
-    setWinner(null);
-    setMarginInput("");
+    setScoreA("");
+    setScoreB("");
     setMvpOff("");
     setMvpDef("");
   };
@@ -548,20 +882,19 @@ export default function App() {
     setSelSwap(null);
   };
 
-  const autoTh = useMemo(() => autoThresholds(matches), [matches]);
-  const effectiveThresholds =
-    thresholdMode === "manual"
-      ? { small: manualSmall, medium: manualMedium, n: null }
-      : autoTh || { ...DEFAULT_THRESHOLDS, n: 0 };
 
   const saveResult = () => {
-    if (!winner) {
-      setError("Choisis qui a gagné (ou match nul).");
-      return;
-    }
-    const margin = winner === "draw" ? 0 : Number(marginInput);
-    if (winner !== "draw" && (!Number.isFinite(margin) || marginInput.trim() === "" || margin <= 0)) {
-      setError("Entre un écart de buts valide (un nombre positif).");
+    const gA = Number(scoreA);
+    const gB = Number(scoreB);
+    if (
+      scoreA.trim() === "" ||
+      scoreB.trim() === "" ||
+      !Number.isFinite(gA) ||
+      !Number.isFinite(gB) ||
+      gA < 0 ||
+      gB < 0
+    ) {
+      setError("Entre le score des deux équipes (deux nombres positifs ou zéro).");
       return;
     }
     if (teamA.length === 0 || teamB.length === 0) {
@@ -569,52 +902,24 @@ export default function App() {
       return;
     }
     setError("");
-    const diff = winner === "A" ? margin : winner === "B" ? -margin : 0;
-    const outcome = winner;
-    const absDiff = Math.abs(diff);
-    const tier =
-      outcome === "draw"
-        ? null
-        : absDiff <= effectiveThresholds.small
-        ? "small"
-        : absDiff <= effectiveThresholds.medium
-        ? "medium"
-        : "large";
-    const { M, errOffA, errDefA, errOffB, errDefB } = computeErrorsFromOutcome(
-      teamA,
-      teamB,
-      outcome,
-      tier
-    );
+    const diff = gA - gB;
+    const outcome = diff > 0 ? "A" : diff < 0 ? "B" : "draw";
+    const { M, errA, errB } = computeErrorsFromOutcome(teamA, teamB, outcome, diff);
     const idsA = new Set(teamA.map((p) => p.id));
     const idsB = new Set(teamB.map((p) => p.id));
     const ratingsAfter = {};
     const next = players.map((p) => {
-      const k = kFor(p) * M;
-      let off = p.off,
-        def = p.def,
-        games = p.games;
-      if (idsA.has(p.id)) {
-        const w = gkWeights(teamA.length, p.id === gkA, !!gkA);
-        off += k * errOffA * w.off;
-        def += k * errDefA * w.def;
-        games += 1;
-      } else if (idsB.has(p.id)) {
-        const w = gkWeights(teamB.length, p.id === gkB, !!gkB);
-        off += k * errOffB * w.off;
-        def += k * errDefB * w.def;
-        games += 1;
-      } else {
-        return p;
-      }
-      if (p.id === mvpOff) off += MVP_BONUS;
-      if (p.id === mvpDef) def += MVP_BONUS;
-      ratingsAfter[p.id] = { off, def };
-      return { ...p, off, def, games };
+      const inA = idsA.has(p.id);
+      if (!inA && !idsB.has(p.id)) return p;
+      let rating = overall(p) + kFor(p) * M * (inA ? errA : errB);
+      if (p.id === mvpOff) rating += MVP_BONUS;
+      if (p.id === mvpDef) rating += MVP_BONUS;
+      ratingsAfter[p.id] = { rating };
+      return { ...p, rating, games: p.games + 1 };
     });
     const allNames = new Map([...teamA, ...teamB].map((p) => [p.id, p.name]));
     // Snapshot d'avant-match, pour pouvoir annuler la dernière saisie.
-    persistUndo({ players, matchId: null, savedAt: new Date().toISOString() });
+    persistUndo({ players, matches, savedAt: new Date().toISOString(), kind: "match" });
     persistPlayers(next);
     persistMatches([
       {
@@ -622,13 +927,12 @@ export default function App() {
         date: new Date().toISOString(),
         teamA: teamA.map((p) => p.name),
         teamB: teamB.map((p) => p.name),
+        goalsA: gA,
+        goalsB: gB,
         diff,
         outcome,
-        tier,
         mvpOffName: allNames.get(mvpOff) || null,
         mvpDefName: allNames.get(mvpDef) || null,
-        gkAName: allNames.get(gkA) || null,
-        gkBName: allNames.get(gkB) || null,
         ratingsAfter,
       },
       ...matches,
@@ -637,12 +941,10 @@ export default function App() {
     setTeamB([]);
     setOptions([]);
     setPresent(new Set());
-    setWinner(null);
-    setMarginInput("");
+    setScoreA("");
+    setScoreB("");
     setMvpOff("");
     setMvpDef("");
-    setGkA("");
-    setGkB("");
     setSelSwap(null);
   };
 
@@ -655,9 +957,8 @@ export default function App() {
     [players]
   );
   const ranked = useMemo(() => {
-    const value = (p) => (sortKey === "off" ? p.off : sortKey === "def" ? p.def : overall(p));
-    return [...players].filter(isActive).sort((a, b) => value(b) - value(a));
-  }, [players, sortKey]);
+    return [...players].filter(isActive).sort((a, b) => overall(b) - overall(a));
+  }, [players]);
 
   // Bilan V/N/D par joueur actif. Le pourcentage compte un nul comme un
   // demi-succès, et se calcule sur les matchs effectivement joués.
@@ -672,6 +973,8 @@ export default function App() {
     rows.sort((a, b) => {
       if (recordSort === "wins") return b.wins - a.wins || b.played - a.played;
       if (recordSort === "games") return b.played - a.played || b.wins - a.wins;
+      if (recordSort === "streak")
+        return b.bestStreak - a.bestStreak || b.wins - a.wins || b.played - a.played;
       if (recordSort === "pm") {
         if (a.pmAvg === null && b.pmAvg === null) return a.name.localeCompare(b.name);
         if (a.pmAvg === null) return 1;
@@ -686,6 +989,39 @@ export default function App() {
     });
     return rows;
   }, [players, matches, recordSort]);
+
+  // Duos et rivalités. Calculés sur tout l'historique, y compris les joueurs
+  // archivés : un duo mythique reste un duo mythique même si l'un a arrêté.
+  const affinites = useMemo(() => {
+    const activeNames = new Set(players.filter(isActive).map((p) => p.name));
+    const r = pairStats(matches, activeNames);
+    // Jamais-vus : paires de joueurs actifs qui n'ont jamais été coéquipiers.
+    // On n'exige pas qu'ils soient tous deux rodés, mais on écarte les joueurs
+    // qui ont à peine joué, sinon un nouveau venu remplit toute la liste.
+    const eligible = players.filter((p) => isActive(p) && (p.games || 0) >= PAIR_MIN);
+    const never = [];
+    for (let i = 0; i < eligible.length; i++) {
+      for (let j = i + 1; j < eligible.length; j++) {
+        const [n1, n2] = [eligible[i].name, eligible[j].name].sort();
+        if (!r.mates.has(`${n1}||${n2}`)) {
+          never.push({ a: n1, b: n2, games: Math.min(eligible[i].games, eligible[j].games) });
+        }
+      }
+    }
+    never.sort((x, y) => y.games - x.games);
+    return { ...r, never, totalPairs: r.frequentDuos.length };
+  }, [matches, players]);
+
+  const affList = useMemo(() => {
+    if (affView === "nemesis") {
+      return [...affinites.rivalries].sort((a, b) => b.score - a.score || b.n - a.n).slice(0, 10);
+    }
+    if (affView === "explosive") return affinites.explosive.slice(0, 10);
+    if (affView === "tight") return affinites.tightest.slice(0, 10);
+    if (affView === "never") return affinites.never.slice(0, 12);
+    const sorted = [...affinites.duos].sort((a, b) => b.score - a.score || b.n - a.n);
+    return (affView === "worst" ? sorted.reverse() : sorted).slice(0, 10);
+  }, [affinites, affView]);
 
   if (loading) {
     return (
@@ -736,6 +1072,7 @@ export default function App() {
             { key: "seance", label: "Séance" },
             { key: "classement", label: "Classement" },
             { key: "bilan", label: "Bilan" },
+            { key: "affinites", label: "Affinités" },
           ].map((t) => (
             <button
               key={t.key}
@@ -763,41 +1100,47 @@ export default function App() {
         </div>
       )}
 
+      {notice && (
+        <div
+          style={{
+            background: "#E7ECF5",
+            color: "#001E50",
+            padding: "9px 20px",
+            fontSize: 12.5,
+            display: "flex",
+            gap: 10,
+            alignItems: "flex-start",
+          }}
+        >
+          <div style={{ flex: 1 }}>{notice}</div>
+          <button
+            onClick={() => setNotice("")}
+            style={{
+              background: "none",
+              border: "none",
+              color: "#001E50",
+              fontSize: 14,
+              fontWeight: 700,
+              padding: 0,
+            }}
+            aria-label="Masquer"
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
       {tab === "classement" && (
         <section style={{ padding: "18px 20px" }}>
           <div className="of-title" style={{ fontSize: 15, marginBottom: 10, color: "#001E50" }}>
             Classement
           </div>
-          <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
-            {[
-              { key: "off", label: "Attaque" },
-              { key: "def", label: "Défense" },
-              { key: "overall", label: "Combiné" },
-            ].map((s) => (
-              <button
-                key={s.key}
-                onClick={() => setSortKey(s.key)}
-                style={{
-                  flex: 1,
-                  padding: "8px 6px",
-                  borderRadius: 6,
-                  border: sortKey === s.key ? "2px solid #001E50" : "1px solid #E1E3E8",
-                  background: sortKey === s.key ? "#E7ECF5" : "#FFFFFF",
-                  fontWeight: 600,
-                  fontSize: 13,
-                }}
-              >
-                {s.label}
-              </button>
-            ))}
-          </div>
-
           {ranked.length === 0 ? (
             <div style={{ fontSize: 13, color: "#6B6C72" }}>
               Aucun joueur actif pour l'instant.
             </div>
           ) : (
-            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div>
               {ranked.map((p, i) => (
                 <div
                   key={p.id}
@@ -806,7 +1149,7 @@ export default function App() {
                     alignItems: "center",
                     gap: 8,
                     borderBottom: "1px solid #F0F1F4",
-                    padding: "9px 2px",
+                    padding: "10px 2px",
                   }}
                 >
                   <div
@@ -826,7 +1169,7 @@ export default function App() {
                       const form = recentForm(p.id, playerStats(p.name, matches).history);
                       return (
                         <div style={{ fontSize: 10, fontWeight: 600, color: "#A8ABB2", marginTop: 1 }}>
-                          ± {uncertainty(p)}
+                          ± {uncertainty(p)} · {p.games} match{p.games > 1 ? "s" : ""}
                           {form !== null && Math.abs(form) >= 1
                             ? ` · forme ${form > 0 ? "↑ +" : "↓ "}${Math.round(form)}`
                             : ""}
@@ -834,32 +1177,14 @@ export default function App() {
                       );
                     })()}
                   </div>
-                  {[
-                    { v: p.off, key: "off" },
-                    { v: p.def, key: "def" },
-                  ].map(({ v, key }) => (
-                    <div
-                      key={key}
-                      style={{
-                        width: 42,
-                        textAlign: "right",
-                        fontFamily: "'Roboto Mono', monospace",
-                        fontSize: 12.5,
-                        fontWeight: sortKey === key ? 700 : 500,
-                        color: sortKey === key ? "#001E50" : "#5C5F66",
-                      }}
-                    >
-                      {Math.round(v)}
-                    </div>
-                  ))}
                   <div
                     style={{
-                      width: 46,
+                      width: 54,
                       textAlign: "right",
                       fontFamily: "'Roboto Mono', monospace",
-                      fontSize: 15,
+                      fontSize: 17,
                       fontWeight: 700,
-                      color: sortKey === "overall" ? "#001E50" : "#5C5F66",
+                      color: "#001E50",
                     }}
                   >
                     {Math.round(overall(p))}
@@ -868,8 +1193,11 @@ export default function App() {
               ))}
             </div>
           )}
-          <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 8 }}>
-            Classement des joueurs actifs uniquement. Le tri en cours est mis en évidence.
+          <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 10, lineHeight: 1.5 }}>
+            Joueurs actifs uniquement. Tout le monde part de 1000 ; la note monte ou descend selon
+            le résultat et l'ampleur du score, en tenant compte de la force des deux équipes. Le ±
+            indique la marge d'incertitude : elle se resserre à mesure que le joueur accumule des
+            matchs.
           </div>
         </section>
       )}
@@ -879,24 +1207,31 @@ export default function App() {
           <div className="of-title" style={{ fontSize: 15, marginBottom: 10, color: "#001E50" }}>
             Bilan victoires / défaites
           </div>
-          <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+              gap: 6,
+              marginBottom: 12,
+            }}
+          >
             {[
+              { key: "wins", label: "Victoires" },
+              { key: "streak", label: "Série" },
               { key: "pm", label: "+/- moyen" },
               { key: "pct", label: "% vict." },
-              { key: "wins", label: "Victoires" },
               { key: "games", label: "Matchs" },
             ].map((s) => (
               <button
                 key={s.key}
                 onClick={() => setRecordSort(s.key)}
                 style={{
-                  flex: 1,
-                  padding: "8px 6px",
+                  padding: "8px 4px",
                   borderRadius: 6,
                   border: recordSort === s.key ? "2px solid #001E50" : "1px solid #E1E3E8",
                   background: recordSort === s.key ? "#E7ECF5" : "#FFFFFF",
                   fontWeight: 600,
-                  fontSize: 12.5,
+                  fontSize: 11.5,
                 }}
               >
                 {s.label}
@@ -943,35 +1278,289 @@ export default function App() {
                         : ""}
                     </div>
                   </div>
-                  <div style={{ textAlign: "right" }}>
-                    <div
-                      style={{
-                        fontSize: 15,
-                        fontWeight: 700,
-                        color:
-                          r.pmAvg === null ? "#6B6C72" : r.pmAvg >= 0 ? "#001E50" : "#B4000F",
-                        fontVariantNumeric: "tabular-nums",
-                      }}
-                    >
-                      {r.pmAvg === null
-                        ? "—"
-                        : `${r.pmAvg >= 0 ? "+" : ""}${r.pmAvg.toFixed(1)}`}
-                    </div>
-                    <div style={{ fontSize: 11, color: "#6B6C72", fontVariantNumeric: "tabular-nums" }}>
-                      {r.pct === null ? "" : `${Math.round(r.pct)} % vict.`}
-                    </div>
-                  </div>
+                  {(() => {
+                    // La valeur de droite suit le tri choisi : on met en avant
+                    // le chiffre sur lequel le classement est fait.
+                    const tier = streakTier(r.bestStreak);
+                    let big, small, color;
+                    if (recordSort === "streak") {
+                      big = r.bestStreak > 0 ? `${r.bestStreak}` : "—";
+                      small = tier ? tier.label : r.bestStreak > 0 ? "d'affilée" : "";
+                      color = tier ? "#B2790A" : "#001E50";
+                    } else if (recordSort === "pm") {
+                      big =
+                        r.pmAvg === null ? "—" : `${r.pmAvg >= 0 ? "+" : ""}${r.pmAvg.toFixed(1)}`;
+                      small = r.pct === null ? "" : `${Math.round(r.pct)} % vict.`;
+                      color = r.pmAvg === null ? "#6B6C72" : r.pmAvg >= 0 ? "#001E50" : "#B4000F";
+                    } else if (recordSort === "pct") {
+                      big = r.pct === null ? "—" : `${Math.round(r.pct)}%`;
+                      small = `${r.wins}V`;
+                      color = "#001E50";
+                    } else if (recordSort === "games") {
+                      big = `${r.played}`;
+                      small = "matchs";
+                      color = "#001E50";
+                    } else {
+                      big = `${r.wins}`;
+                      small = r.pct === null ? "victoires" : `${Math.round(r.pct)} % vict.`;
+                      color = "#001E50";
+                    }
+                    return (
+                      <div style={{ textAlign: "right", minWidth: 62 }}>
+                        <div
+                          style={{
+                            fontSize: 15,
+                            fontWeight: 700,
+                            color,
+                            fontVariantNumeric: "tabular-nums",
+                          }}
+                        >
+                          {big}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 10.5,
+                            color: recordSort === "streak" && tier ? "#B2790A" : "#6B6C72",
+                            fontWeight: recordSort === "streak" && tier ? 700 : 400,
+                          }}
+                        >
+                          {small}
+                        </div>
+                      </div>
+                    );
+                  })()}
                 </div>
               ))}
             </div>
           )}
-          <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 8 }}>
-            Le <strong>+/- moyen</strong> est l'écart de buts moyen des matchs joués, vu du côté du
-            joueur : il tient compte de l'ampleur des résultats, pas seulement du gagnant, ce qui en
-            fait un indicateur plus fidèle que le pourcentage de victoires. Le nul compte comme un
-            demi-succès dans ce pourcentage. Attention aux petits échantillons : les deux chiffres
-            sont très bruités en dessous d'une dizaine de matchs, et dépendent aussi des
-            coéquipiers.
+          {(() => {
+            const top = records.reduce(
+              (best, r) => (!best || r.bestStreak > best.bestStreak ? r : best),
+              null
+            );
+            if (!top || top.bestStreak < 2) return null;
+            const tier = streakTier(top.bestStreak);
+            const live = records.filter((r) => r.currentStreak >= 2);
+            return (
+              <div
+                style={{
+                  marginTop: 14,
+                  background: "#F4F5F8",
+                  border: "1px solid #DDE0E6",
+                  borderRadius: 8,
+                  padding: "10px 12px",
+                  fontSize: 12,
+                  color: "#3A3B41",
+                }}
+              >
+                <strong style={{ color: "#001E50" }}>Série record</strong> — {top.name},{" "}
+                {top.bestStreak} victoires d'affilée
+                {tier ? (
+                  <strong style={{ color: "#B2790A" }}> « {tier.label} »</strong>
+                ) : null}
+                .
+                {live.length > 0 ? (
+                  <div style={{ marginTop: 4, color: "#6B6C72" }}>
+                    En cours :{" "}
+                    {live
+                      .sort((a, b) => b.currentStreak - a.currentStreak)
+                      .map((r) => `${r.name} (${r.currentStreak})`)
+                      .join(", ")}
+                  </div>
+                ) : null}
+              </div>
+            );
+          })()}
+          <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 10, lineHeight: 1.5 }}>
+            Classement par nombre total de victoires. La <strong>série</strong> est la plus longue
+            suite de victoires consécutives, un nul la casse au même titre qu'une défaite ; les
+            paliers reprennent ceux d'Unreal Tournament, transposés au futsal (3 = Killing Spree,
+            5 = Dominating, 8 = Godlike, 10 = Wicked Sick). Le <strong>+/- moyen</strong> est
+            l'écart de buts moyen des matchs joués, vu du côté du joueur : il tient compte de
+            l'ampleur des résultats, pas seulement du gagnant. Le nul compte comme un demi-succès
+            dans le pourcentage. Attention aux petits échantillons : tout cela est très bruité en
+            dessous d'une dizaine de matchs, et dépend aussi des coéquipiers.
+          </div>
+        </section>
+      )}
+
+      {tab === "affinites" && (
+        <section style={{ padding: "18px 20px" }}>
+          <div className="of-title" style={{ fontSize: 15, marginBottom: 10, color: "#001E50" }}>
+            Affinités
+          </div>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+              gap: 6,
+              marginBottom: 12,
+            }}
+          >
+            {[
+              { key: "best", label: "Meilleurs" },
+              { key: "worst", label: "Pires" },
+              { key: "nemesis", label: "Bêtes noires" },
+              { key: "explosive", label: "Explosifs" },
+              { key: "tight", label: "Duels serrés" },
+              { key: "never", label: "Jamais vus" },
+            ].map((s) => (
+              <button
+                key={s.key}
+                onClick={() => setAffView(s.key)}
+                style={{
+                  padding: "8px 4px",
+                  borderRadius: 6,
+                  border: affView === s.key ? "2px solid #001E50" : "1px solid #E1E3E8",
+                  background: affView === s.key ? "#E7ECF5" : "#FFFFFF",
+                  fontWeight: 600,
+                  fontSize: 11.5,
+                }}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+
+          {affList.length === 0 ? (
+            <div style={{ fontSize: 13, color: "#6B6C72", lineHeight: 1.5 }}>
+              {affView === "never"
+                ? "Toutes les paires de joueurs rodés ont déjà joué ensemble au moins une fois — beau brassage."
+                : affView === "explosive"
+                ? `Il faut au moins ${PAIR_MIN} matchs avec le score détaillé saisi pour qu'une paire apparaisse ici. Les matchs enregistrés avant la saisie du score complet ne comptent pas.`
+                : affView === "tight"
+                ? `Il faut au moins ${TIGHT_MIN} confrontations entre deux joueurs pour parler de rivalité serrée.`
+                : `Pas encore assez de données : il faut qu'une paire ait joué au moins ${PAIR_MIN} matchs${
+                    affView === "nemesis" ? " l'un contre l'autre" : " ensemble"
+                  } pour apparaître ici.`}
+              {affinites.totalPairs > 0 && affView !== "never"
+                ? ` Paire la plus assidue pour l'instant : ${affinites.frequentDuos[0].a} et ${affinites.frequentDuos[0].b}, ${affinites.frequentDuos[0].n} match${
+                    affinites.frequentDuos[0].n > 1 ? "s" : ""
+                  } ensemble.`
+                : ""}
+            </div>
+          ) : (
+            <div>
+              {affList.map((e, i) => {
+                // Chaque vue a sa propre ligne : titre, détail, valeur à droite.
+                let title, detail, value, valueColor;
+                if (affView === "nemesis") {
+                  title = (
+                    <>
+                      {e.victim} <span style={{ color: "#8A8D95", fontWeight: 500 }}>subit</span>{" "}
+                      {e.nemesis}
+                    </>
+                  );
+                  detail = `${e.vWins}V · ${e.draws}N · ${e.nWins}D sur ${e.n} confrontation${
+                    e.n > 1 ? "s" : ""
+                  }`;
+                  value = `${Math.round((e.nWins / Math.max(1, e.n)) * 100)}%`;
+                  valueColor = "#B4000F";
+                } else if (affView === "explosive") {
+                  title = `${e.a} + ${e.b}`;
+                  detail = `${e.gaAvg.toFixed(1)} encaissés · sur ${e.nScored} match${
+                    e.nScored > 1 ? "s" : ""
+                  } au score connu`;
+                  value = e.gfAvg.toFixed(1);
+                  valueColor = "#001E50";
+                } else if (affView === "tight") {
+                  title = (
+                    <>
+                      {e.a} <span style={{ color: "#8A8D95", fontWeight: 500 }}>contre</span> {e.b}
+                    </>
+                  );
+                  detail = `${e.aWins} — ${e.bWins}${e.draws ? ` · ${e.draws}N` : ""} sur ${
+                    e.n
+                  } confrontations`;
+                  value = `${Math.round(e.rate * 100)}%`;
+                  valueColor = "#001E50";
+                } else if (affView === "never") {
+                  title = `${e.a} + ${e.b}`;
+                  detail = "jamais dans la même équipe";
+                  value = "—";
+                  valueColor = "#A8ABB2";
+                } else {
+                  title = `${e.a} + ${e.b}`;
+                  detail = `${e.w}V · ${e.d}N · ${e.l}D sur ${e.n} match${
+                    e.n > 1 ? "s" : ""
+                  } ensemble · +/- ${e.pm >= 0 ? "+" : ""}${e.pm}`;
+                  value = `${Math.round(((e.w + 0.5 * e.d) / e.n) * 100)}%`;
+                  valueColor = affView === "worst" ? "#B4000F" : "#001E50";
+                }
+                return (
+                  <div
+                    key={i}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      borderBottom: "1px solid #F0F1F4",
+                      padding: "10px 2px",
+                    }}
+                  >
+                    <div
+                      style={{
+                        width: 22,
+                        fontFamily: "'Roboto Mono', monospace",
+                        fontSize: 12.5,
+                        fontWeight: 700,
+                        color: i < 3 ? "#001E50" : "#A8ABB2",
+                      }}
+                    >
+                      {i + 1}
+                    </div>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ fontSize: 14, fontWeight: 700, color: "#16171A" }}>{title}</div>
+                      <div
+                        style={{ fontSize: 10.5, fontWeight: 600, color: "#A8ABB2", marginTop: 1 }}
+                      >
+                        {detail}
+                      </div>
+                    </div>
+                    <div
+                      style={{
+                        textAlign: "right",
+                        fontFamily: "'Roboto Mono', monospace",
+                        fontSize: 15,
+                        fontWeight: 700,
+                        color: valueColor,
+                      }}
+                    >
+                      {value}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {affinites.frequentDuos.length > 0 && (
+            <div
+              style={{
+                marginTop: 14,
+                background: "#F4F5F8",
+                border: "1px solid #DDE0E6",
+                borderRadius: 8,
+                padding: "10px 12px",
+                fontSize: 12,
+                color: "#3A3B41",
+              }}
+            >
+              <strong style={{ color: "#001E50" }}>Inséparables</strong> —{" "}
+              {affinites.frequentDuos[0].a} et {affinites.frequentDuos[0].b} ont joué{" "}
+              {affinites.frequentDuos[0].n} fois dans la même équipe, le record du groupe.
+            </div>
+          )}
+
+          <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 10, lineHeight: 1.5 }}>
+            À prendre pour ce que c'est : du chambrage, pas de la science. Deux joueurs ne sont
+            coéquipiers qu'environ un match sur dix, donc ces paires reposent sur très peu de
+            matchs — le pourcentage affiché est le taux brut, mais le classement applique un
+            lissage pour qu'une paire à 3 matchs ne coiffe pas une paire qui en a dix. Il faut une
+            bonne cinquantaine de séances avant que ces podiums veuillent dire quelque chose.
+            {affView === "explosive"
+              ? " Les duos explosifs ne comptent que les matchs dont le score complet a été saisi."
+              : ""}
           </div>
         </section>
       )}
@@ -1104,96 +1693,65 @@ export default function App() {
             )}
 
             <div style={{ marginTop: 14 }}>
-              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", marginBottom: 4 }}>
-                Résultat
+              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", marginBottom: 6 }}>
+                Score final
               </label>
-              <div style={{ display: "flex", gap: 6 }}>
+              <div style={{ display: "flex", alignItems: "flex-end", gap: 10 }}>
                 {[
-                  { key: "A", label: "A gagne" },
-                  { key: "draw", label: "Nul" },
-                  { key: "B", label: "B gagne" },
-                ].map((o) => (
-                  <button
-                    key={o.key}
-                    onClick={() => {
-                      setWinner(o.key);
-                      if (o.key === "draw") setMarginInput("");
-                    }}
-                    style={{
-                      flex: 1,
-                      padding: "8px 6px",
-                      borderRadius: 6,
-                      border: winner === o.key ? "2px solid #001E50" : "1px solid #E1E3E8",
-                      background: winner === o.key ? "#E7ECF5" : "#FFFFFF",
-                      fontWeight: 600,
-                      fontSize: 13,
-                    }}
-                  >
-                    {o.label}
-                  </button>
+                  { v: scoreA, set: setScoreA, lab: "Équipe A", color: "#001E50" },
+                  { v: scoreB, set: setScoreB, lab: "Équipe B", color: "#B4000F" },
+                ].map(({ v, set, lab, color }, i) => (
+                  <React.Fragment key={lab}>
+                    {i === 1 && (
+                      <div style={{ fontSize: 16, fontWeight: 800, color: "#B0B3BA", paddingBottom: 10 }}>
+                        —
+                      </div>
+                    )}
+                    <div style={{ flex: 1 }}>
+                      <div
+                        style={{
+                          fontSize: 10,
+                          fontWeight: 800,
+                          letterSpacing: "0.08em",
+                          textTransform: "uppercase",
+                          color: "#8A8D95",
+                          marginBottom: 3,
+                        }}
+                      >
+                        {lab}
+                      </div>
+                      <input
+                        type="number"
+                        inputMode="numeric"
+                        min="0"
+                        value={v}
+                        onChange={(e) => set(e.target.value)}
+                        placeholder="0"
+                        style={{
+                          width: "100%",
+                          padding: "11px 10px",
+                          borderRadius: 6,
+                          border: "1px solid #E1E3E8",
+                          fontFamily: "'Roboto Mono', monospace",
+                          fontSize: 20,
+                          fontWeight: 700,
+                          color,
+                          textAlign: "center",
+                        }}
+                      />
+                    </div>
+                  </React.Fragment>
                 ))}
               </div>
-
-              {winner && winner !== "draw" && (
-                <>
-                  <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
-                    Écart de buts
-                  </label>
-                  <input
-                    type="number"
-                    inputMode="numeric"
-                    min="1"
-                    value={marginInput}
-                    onChange={(e) => setMarginInput(e.target.value)}
-                    placeholder="ex: 6"
-                    style={{ width: "100%", padding: "9px 10px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 14 }}
-                  />
-                </>
+              {scoreA.trim() !== "" && scoreB.trim() !== "" && (
+                <div style={{ fontSize: 12, color: "#001E50", fontWeight: 600, marginTop: 6 }}>
+                  {Number(scoreA) === Number(scoreB)
+                    ? "Match nul"
+                    : `Victoire ${Number(scoreA) > Number(scoreB) ? "A" : "B"} de ${Math.abs(
+                        Number(scoreA) - Number(scoreB)
+                      )} but${Math.abs(Number(scoreA) - Number(scoreB)) > 1 ? "s" : ""}`}
+                </div>
               )}
-              <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
-                Seuils actuels — petit ≤ {effectiveThresholds.small}, moyen ≤ {effectiveThresholds.medium}
-                {effectiveThresholds.n
-                  ? ` (terciles sur ${effectiveThresholds.n} match${effectiveThresholds.n > 1 ? "s" : ""})`
-                  : thresholdMode === "manual"
-                  ? " (réglage manuel)"
-                  : " (valeurs par défaut — encore trop peu de matchs pour calculer des terciles)"}
-              </div>
-
-              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "12px 0 4px" }}>
-                Gardien équipe A (optionnel)
-              </label>
-              <select
-                value={gkA}
-                onChange={(e) => setGkA(e.target.value)}
-                style={{ width: "100%", padding: "10px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
-              >
-                <option value="">Aucun / non renseigné</option>
-                {teamA.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-
-              <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
-                Gardien équipe B (optionnel)
-              </label>
-              <select
-                value={gkB}
-                onChange={(e) => setGkB(e.target.value)}
-                style={{ width: "100%", padding: "10px 8px", borderRadius: 6, border: "1px solid #E1E3E8", fontSize: 13 }}
-              >
-                <option value="">Aucun / non renseigné</option>
-                {teamB.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.name}
-                  </option>
-                ))}
-              </select>
-              <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
-                Renseigner le gardien lui attribue une plus grande part du résultat défensif, et
-                épargne d'autant les joueurs de champ.
-              </div>
 
               <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "12px 0 4px" }}>
                 MVP offensif (optionnel)
@@ -1226,6 +1784,10 @@ export default function App() {
                   </option>
                 ))}
               </select>
+              <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
+                Chaque titre de MVP ajoute un bonus à la note du joueur élu. Être désigné dans les
+                deux catégories cumule les deux bonus.
+              </div>
 
               <button
                 onClick={saveResult}
@@ -1286,7 +1848,7 @@ export default function App() {
 
         {players.length === 0 ? (
           <div style={{ fontSize: 13, color: "#6B6C72" }}>
-            Ajoute tes ~20 joueurs habituels. Chacun démarre à 1000 en attaque et en défense.
+            Ajoute tes ~20 joueurs habituels. Chacun démarre à 1000.
           </div>
         ) : (
           <div>
@@ -1306,8 +1868,6 @@ export default function App() {
             >
               <span style={{ width: 26, flexShrink: 0 }} />
               <span style={{ flex: 1 }}>Joueur</span>
-              <span style={{ width: 42, textAlign: "right" }}>Att</span>
-              <span style={{ width: 42, textAlign: "right" }}>Déf</span>
               <span style={{ width: 46, textAlign: "right" }}>Note</span>
               <span style={{ width: 14 }} />
             </div>
@@ -1399,28 +1959,6 @@ export default function App() {
                     </div>
                     <div
                       style={{
-                        width: 42,
-                        textAlign: "right",
-                        fontFamily: "'Roboto Mono', monospace",
-                        fontSize: 12.5,
-                        color: "#5C5F66",
-                      }}
-                    >
-                      {Math.round(p.off)}
-                    </div>
-                    <div
-                      style={{
-                        width: 42,
-                        textAlign: "right",
-                        fontFamily: "'Roboto Mono', monospace",
-                        fontSize: 12.5,
-                        color: "#5C5F66",
-                      }}
-                    >
-                      {Math.round(p.def)}
-                    </div>
-                    <div
-                      style={{
                         width: 46,
                         textAlign: "right",
                         fontFamily: "'Roboto Mono', monospace",
@@ -1495,9 +2033,9 @@ export default function App() {
                         <span style={{ color: "#6B6C72", fontWeight: 400 }}>· {p.games} match{p.games > 1 ? "s" : ""} au total</span>
                       </div>
                       <div style={{ color: "#6B6C72", marginBottom: 8 }}>
-                        Notes : attaque {Math.round(p.off)} · défense {Math.round(p.def)} ·{" "}
-                        <strong style={{ color: "#001E50" }}>combiné {Math.round(overall(p))}</strong>{" "}
-                        (± {uncertainty(p)})
+                        Note :{" "}
+                        <strong style={{ color: "#001E50" }}>{Math.round(overall(p))}</strong> (±{" "}
+                        {uncertainty(p)})
                         {(() => {
                           const form = recentForm(p.id, stats.history);
                           if (form === null || Math.abs(form) < 1) return null;
@@ -1519,6 +2057,21 @@ export default function App() {
                               stats.pm / stats.history.length
                             ).toFixed(1)} but${Math.abs(stats.pm / stats.history.length) >= 2 ? "s" : ""} par match`}
                       </div>
+                      {stats.bestStreak >= 2 && (
+                        <div style={{ color: "#6B6C72", marginBottom: 8 }}>
+                          Meilleure série :{" "}
+                          <strong style={{ color: "#001E50" }}>
+                            {stats.bestStreak} victoires d'affilée
+                          </strong>
+                          {streakTier(stats.bestStreak) ? (
+                            <strong style={{ color: "#B2790A" }}>
+                              {" "}
+                              « {streakTier(stats.bestStreak).label} »
+                            </strong>
+                          ) : null}
+                          {stats.currentStreak >= 2 ? ` · en cours : ${stats.currentStreak}` : ""}
+                        </div>
+                      )}
                       <div style={{ color: "#6B6C72", marginBottom: 8 }}>
                         Présence :{" "}
                         {matches.length === 0
@@ -1526,28 +2079,48 @@ export default function App() {
                           : `${Math.round((stats.history.length / matches.length) * 100)} % (${stats.history.length}/${matches.length} séances)`}
                       </div>
                       {(() => {
-                        const chrono = [...stats.history].reverse();
-                        const offVals = [],
-                          defVals = [];
-                        for (const m of chrono) {
+                        const { bestAlly, worstFoe } = playerAffinities(
+                          p.name,
+                          affinites.mates,
+                          affinites.foes
+                        );
+                        if (!bestAlly && !worstFoe) return null;
+                        return (
+                          <div style={{ color: "#6B6C72", marginBottom: 8 }}>
+                            {bestAlly && (
+                              <div>
+                                Meilleur allié :{" "}
+                                <strong style={{ color: "#001E50" }}>{bestAlly.who}</strong> (
+                                {bestAlly.w}V · {bestAlly.d}N · {bestAlly.l}D ensemble)
+                              </div>
+                            )}
+                            {worstFoe && (
+                              <div>
+                                Bête noire :{" "}
+                                <strong style={{ color: "#B4000F" }}>{worstFoe.who}</strong> (
+                                {worstFoe.wins}V · {worstFoe.draws}N · {worstFoe.losses}D contre
+                                lui)
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
+                      {(() => {
+                        const vals = [];
+                        for (const m of [...stats.history].reverse()) {
                           const r = m.ratingsAfter && m.ratingsAfter[p.id];
-                          if (r) {
-                            offVals.push(r.off);
-                            defVals.push(r.def);
-                          }
+                          if (r)
+                            vals.push(
+                              Number.isFinite(r.rating) ? r.rating : (r.off + r.def) / 2
+                            );
                         }
-                        if (offVals.length < 2) return null;
+                        if (vals.length < 2) return null;
                         return (
                           <div style={{ marginBottom: 10 }}>
                             <div style={{ color: "#6B6C72", marginBottom: 2 }}>
-                              Progression (attaque en rouge, défense en bleu)
+                              Progression de la note
                             </div>
-                            <Sparkline
-                              series={[
-                                { label: "off", values: offVals, color: "#E1000F" },
-                                { label: "def", values: defVals, color: "#001E50" },
-                              ]}
-                            />
+                            <Sparkline series={[{ label: "note", values: vals, color: "#001E50" }]} />
                           </div>
                         );
                       })()}
@@ -1565,7 +2138,15 @@ export default function App() {
                                 {new Date(m.date).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "numeric" })}
                                 {" · "}
                                 <strong style={{ color: "#001E50" }}>{m.result}</strong>
-                                {m.outcome !== "draw" ? ` (écart ${Math.abs(m.diff)})` : ""}
+                                {Number.isFinite(m.goalsA) && Number.isFinite(m.goalsB)
+                                  ? ` ${
+                                      m.teamA.includes(p.name)
+                                        ? `${m.goalsA}-${m.goalsB}`
+                                        : `${m.goalsB}-${m.goalsA}`
+                                    }`
+                                  : m.outcome !== "draw"
+                                  ? ` (écart ${Math.abs(m.diff)})`
+                                  : ""}
                               </div>
                               {(m.mvpOffName === p.name || m.mvpDefName === p.name) && (
                                 <div style={{ color: "#B2790A" }}>
@@ -1727,81 +2308,6 @@ export default function App() {
         </div>
       </section>
 
-      {/* SETTINGS */}
-      <section style={{ padding: "6px 20px" }}>
-        <button
-          onClick={() => setShowSettings((s) => !s)}
-          style={{
-            background: "none",
-            border: "none",
-            color: "#001E50",
-            fontWeight: 700,
-            fontSize: 14,
-            padding: 0,
-          }}
-        >
-          {showSettings ? "▾" : "▸"} Réglages des seuils d'écart
-        </button>
-        {showSettings && (
-          <div style={{ marginTop: 10, background: "#FFFFFF", border: "1px solid #E1E3E8", borderRadius: 8, padding: 12 }}>
-            <div style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-              {[
-                { key: "auto", label: "Automatique (terciles)" },
-                { key: "manual", label: "Manuel" },
-              ].map((o) => (
-                <button
-                  key={o.key}
-                  onClick={() => persistThresholds(o.key, manualSmall, manualMedium)}
-                  style={{
-                    flex: 1,
-                    padding: "8px 6px",
-                    borderRadius: 6,
-                    border: thresholdMode === o.key ? "2px solid #001E50" : "1px solid #E1E3E8",
-                    background: thresholdMode === o.key ? "#E7ECF5" : "#FFFFFF",
-                    fontWeight: 600,
-                    fontSize: 13,
-                  }}
-                >
-                  {o.label}
-                </button>
-              ))}
-            </div>
-
-            {thresholdMode === "auto" ? (
-              <div style={{ fontSize: 12.5, color: "#6B6C72" }}>
-                {autoTh
-                  ? `Calculés sur ${autoTh.n} match${autoTh.n > 1 ? "s" : ""} : petit ≤ ${autoTh.small}, moyen ≤ ${autoTh.medium}. Les seuils se remettent à jour à chaque match enregistré — plus vous en jouez, plus ils sont fiables (une douzaine de matchs donne des terciles solides).`
-                  : `Il faut au moins 6 matchs enregistrés pour calculer des terciles (${matches.length}/6 pour l'instant). En attendant, les valeurs par défaut sont utilisées : petit ≤ ${DEFAULT_THRESHOLDS.small}, moyen ≤ ${DEFAULT_THRESHOLDS.medium}.`}
-              </div>
-            ) : (
-              <div>
-                <label style={{ fontSize: 12, color: "#6B6C72", display: "block", marginBottom: 4 }}>
-                  Petit écart si ≤
-                </label>
-                <input
-                  type="number"
-                  value={manualSmall}
-                  onChange={(e) => persistThresholds("manual", Number(e.target.value), manualMedium)}
-                  style={{ width: 80, padding: "7px 8px", borderRadius: 6, border: "1px solid #E1E3E8" }}
-                />
-                <label style={{ fontSize: 12, color: "#6B6C72", display: "block", margin: "10px 0 4px" }}>
-                  Moyen écart si ≤
-                </label>
-                <input
-                  type="number"
-                  value={manualMedium}
-                  onChange={(e) => persistThresholds("manual", manualSmall, Number(e.target.value))}
-                  style={{ width: 80, padding: "7px 8px", borderRadius: 6, border: "1px solid #E1E3E8" }}
-                />
-                <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 8 }}>
-                  Au-delà de ce deuxième seuil, l'écart est considéré comme large.
-                </div>
-              </div>
-            )}
-          </div>
-        )}
-      </section>
-
       {/* HISTORY */}
       <section style={{ padding: "6px 20px" }}>
         <button
@@ -1817,10 +2323,10 @@ export default function App() {
         >
           {showHistory ? "▾" : "▸"} Historique ({matches.length})
         </button>
-        {undo && matches.length > 0 && (
+        {undo && (
           <div style={{ marginTop: 8 }}>
             <button
-              onClick={undoLastMatch}
+              onClick={undoLast}
               style={{
                 background: "none",
                 border: "1px solid #E1000F",
@@ -1831,11 +2337,11 @@ export default function App() {
                 fontWeight: 700,
               }}
             >
-              Annuler le dernier match
+              {undo.kind === "edit" ? "Annuler la correction" : "Annuler le dernier match"}
             </button>
             <div style={{ fontSize: 11.5, color: "#6B6C72", marginTop: 5 }}>
-              Restaure les notes d'avant le dernier résultat enregistré et le retire de
-              l'historique. Disponible pour le dernier match seulement.
+              Remet l'effectif et l'historique dans l'état d'avant la dernière action. Un seul
+              niveau d'annulation : la prochaine saisie ou correction écrase celui-ci.
             </div>
           </div>
         )}
@@ -1844,7 +2350,7 @@ export default function App() {
             {matches.length === 0 && (
               <div style={{ fontSize: 13, color: "#6B6C72" }}>Aucun match enregistré pour l'instant.</div>
             )}
-            {matches.map((m) => (
+            {matches.map((m, mi) => (
               <div
                 key={m.id}
                 style={{ background: "#FFFFFF", border: "1px solid #E1E3E8", borderRadius: 8, padding: 9, fontSize: 12.5 }}
@@ -1853,21 +2359,194 @@ export default function App() {
                   {new Date(m.date).toLocaleDateString("fr-FR", { day: "2-digit", month: "short", year: "numeric" })}
                 </div>
                 <div style={{ fontWeight: m.outcome === "A" ? 700 : 400 }}>
+                  {Number.isFinite(m.goalsA) ? (
+                    <strong style={{ fontFamily: "'Roboto Mono', monospace", marginRight: 6 }}>
+                      {m.goalsA}
+                    </strong>
+                  ) : null}
                   {m.teamA.join(", ")} {m.outcome === "A" ? "✓" : ""}
                 </div>
                 <div style={{ fontWeight: m.outcome === "B" ? 700 : 400 }}>
+                  {Number.isFinite(m.goalsB) ? (
+                    <strong style={{ fontFamily: "'Roboto Mono', monospace", marginRight: 6 }}>
+                      {m.goalsB}
+                    </strong>
+                  ) : null}
                   {m.teamB.join(", ")} {m.outcome === "B" ? "✓" : ""}
                 </div>
                 <div style={{ color: "#6B6C72", marginTop: 3 }}>
                   {m.outcome === "draw"
                     ? "Match nul"
-                    : `Écart ${Math.abs(m.diff)} (${m.tier === "small" ? "petit" : m.tier === "medium" ? "moyen" : "large"})`}
+                    : `Écart ${Math.abs(m.diff)} but${Math.abs(m.diff) > 1 ? "s" : ""}`}
                   {m.mvpOffName ? ` · MVP att. ${m.mvpOffName}` : ""}
                   {m.mvpDefName ? ` · MVP déf. ${m.mvpDefName}` : ""}
-                  {m.gkAName || m.gkBName
-                    ? ` · gardiens ${m.gkAName || "?"} / ${m.gkBName || "?"}`
-                    : ""}
+                  {!Number.isFinite(m.goalsA) ? " · score détaillé non renseigné" : ""}
                 </div>
+
+                {editingId === m.id ? (
+                  <div
+                    style={{
+                      marginTop: 8,
+                      paddingTop: 8,
+                      borderTop: "1px solid #E1E3E8",
+                    }}
+                  >
+                    <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                      {[
+                        { key: "score", label: "Score complet" },
+                        { key: "margin", label: "Écart seul" },
+                      ].map((o) => (
+                        <button
+                          key={o.key}
+                          onClick={() => setEditMode(o.key)}
+                          style={{
+                            flex: 1,
+                            padding: "7px 4px",
+                            borderRadius: 6,
+                            border:
+                              editMode === o.key ? "2px solid #001E50" : "1px solid #E1E3E8",
+                            background: editMode === o.key ? "#E7ECF5" : "#FFFFFF",
+                            fontWeight: 600,
+                            fontSize: 11.5,
+                          }}
+                        >
+                          {o.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {editMode === "score" ? (
+                      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <input
+                          type="number"
+                          inputMode="numeric"
+                          min="0"
+                          value={editA}
+                          onChange={(e) => setEditA(e.target.value)}
+                          placeholder="A"
+                          style={{
+                            flex: 1,
+                            padding: "9px 8px",
+                            borderRadius: 6,
+                            border: "1px solid #E1E3E8",
+                            fontFamily: "'Roboto Mono', monospace",
+                            fontSize: 16,
+                            fontWeight: 700,
+                            color: "#001E50",
+                            textAlign: "center",
+                          }}
+                        />
+                        <span style={{ color: "#B0B3BA", fontWeight: 800 }}>—</span>
+                        <input
+                          type="number"
+                          inputMode="numeric"
+                          min="0"
+                          value={editB}
+                          onChange={(e) => setEditB(e.target.value)}
+                          placeholder="B"
+                          style={{
+                            flex: 1,
+                            padding: "9px 8px",
+                            borderRadius: 6,
+                            border: "1px solid #E1E3E8",
+                            fontFamily: "'Roboto Mono', monospace",
+                            fontSize: 16,
+                            fontWeight: 700,
+                            color: "#B4000F",
+                            textAlign: "center",
+                          }}
+                        />
+                      </div>
+                    ) : (
+                      <>
+                        <input
+                          type="number"
+                          inputMode="numeric"
+                          value={editMargin}
+                          onChange={(e) => setEditMargin(e.target.value)}
+                          placeholder="ex : 6, ou -3 si B gagne"
+                          style={{
+                            width: "100%",
+                            padding: "9px 10px",
+                            borderRadius: 6,
+                            border: "1px solid #E1E3E8",
+                            fontSize: 14,
+                          }}
+                        />
+                        <div style={{ fontSize: 11, color: "#6B6C72", marginTop: 4 }}>
+                          Positif si A gagne, négatif si B gagne, 0 pour un nul. Le score détaillé
+                          de ce match sera effacé plutôt que deviné.
+                        </div>
+                      </>
+                    )}
+
+                    <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+                      <button
+                        onClick={() => saveMatchEdit(m)}
+                        style={{
+                          flex: 1,
+                          background: "#001E50",
+                          color: "#FFFFFF",
+                          border: "none",
+                          borderRadius: 6,
+                          padding: "10px 8px",
+                          fontWeight: 700,
+                          fontSize: 12.5,
+                        }}
+                      >
+                        Enregistrer
+                      </button>
+                      <button
+                        onClick={closeEditor}
+                        style={{
+                          background: "none",
+                          border: "1px solid #E1E3E8",
+                          color: "#6B6C72",
+                          borderRadius: 6,
+                          padding: "10px 12px",
+                          fontWeight: 600,
+                          fontSize: 12.5,
+                        }}
+                      >
+                        Annuler
+                      </button>
+                      <button
+                        onClick={() => deleteMatch(m)}
+                        style={{
+                          background: "none",
+                          border: "1px solid #E1000F",
+                          color: "#B4000F",
+                          borderRadius: 6,
+                          padding: "10px 12px",
+                          fontWeight: 600,
+                          fontSize: 12.5,
+                        }}
+                      >
+                        Supprimer
+                      </button>
+                    </div>
+                    <div style={{ fontSize: 11, color: "#6B6C72", marginTop: 6 }}>
+                      Les notes de ce match seront recalculées ; les matchs précédents ne bougent
+                      pas.
+                    </div>
+                  </div>
+                ) : mi === 0 ? (
+                  <button
+                    onClick={() => openEditor(m)}
+                    style={{
+                      marginTop: 6,
+                      background: "none",
+                      border: "1px solid #E1E3E8",
+                      color: "#001E50",
+                      borderRadius: 5,
+                      padding: "5px 9px",
+                      fontSize: 11.5,
+                      fontWeight: 600,
+                    }}
+                  >
+                    Corriger
+                  </button>
+                ) : null}
               </div>
             ))}
           </div>
