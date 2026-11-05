@@ -118,6 +118,47 @@ function recentForm(playerId, history, window = 5) {
 // minimum de matchs pour apparaître, et un lissage vers 50 % qui fait qu'une
 // paire à 3/3 reste au coude à coude avec une paire à 9/12 au lieu de
 // l'écraser, et une paire à 2 matchs n'apparaît pas du tout.
+// Les six angles de l'onglet Affinités, avec leur pictogramme.
+const AFF_VIEWS = [
+  {
+    key: "best",
+    label: "Meilleurs",
+    icon: "\u{1F91D}",
+    desc: "les paires qui gagnent le plus souvent quand elles sont dans la m\u00eame \u00e9quipe",
+  },
+  {
+    key: "worst",
+    label: "Pires",
+    icon: "\u{1F480}",
+    desc: "les paires maudites : ensemble, \u00e7a ne passe pas",
+  },
+  {
+    key: "nemesis",
+    label: "B\u00eates noires",
+    icon: "\u{1F479}",
+    desc: "celui contre qui un joueur perd le plus souvent en face \u00e0 face",
+  },
+  {
+    key: "explosive",
+    label: "Explosifs",
+    icon: "\u{1F4A5}",
+    desc: "buts marqu\u00e9s en moyenne par leur \u00e9quipe quand ils jouent ensemble",
+  },
+  {
+    key: "tight",
+    label: "Duels serr\u00e9s",
+    icon: "\u2694\ufe0f",
+    desc: "les adversaires les plus proches du 50/50 : les vraies rivalit\u00e9s",
+  },
+  {
+    key: "never",
+    label: "Jamais vus",
+    icon: "\u{1F47B}",
+    desc: "les joueurs rod\u00e9s qui ne se sont jamais retrouv\u00e9s dans la m\u00eame \u00e9quipe",
+  },
+];
+const affView0 = (key) => AFF_VIEWS.find((v) => v.key === key) || AFF_VIEWS[0];
+
 const PAIR_MIN = 3; // matchs ensemble avant d'entrer au classement
 const PAIR_PRIOR = 4; // force du lissage vers 50 %
 const TIGHT_MIN = 5; // confrontations avant de parler de « rivalité serrée »
@@ -554,12 +595,10 @@ export default function App() {
           const r = replayHistory(loadedPlayers, loadedMatches);
           loadedPlayers = r.players.map(({ off, def, ...rest }) => rest);
           loadedMatches = r.matches;
-          await window.storage
-            .set("futsal-players", JSON.stringify(loadedPlayers), true)
-            .catch(() => {});
-          await window.storage
-            .set("futsal-matches", JSON.stringify(loadedMatches), true)
-            .catch(() => {});
+          // Une seule ligne par appel : le portage vers la version web
+          // réécrit ces appels de stockage ligne par ligne.
+          await storage.set("futsal-players", JSON.stringify(loadedPlayers)).catch(() => {});
+          await storage.set("futsal-matches", JSON.stringify(loadedMatches)).catch(() => {});
           setNotice(
             "Classement recalculé : une note unique par joueur, et l'ampleur des victoires compte désormais en continu."
           );
@@ -1397,29 +1436,51 @@ export default function App() {
               marginBottom: 12,
             }}
           >
-            {[
-              { key: "best", label: "Meilleurs" },
-              { key: "worst", label: "Pires" },
-              { key: "nemesis", label: "Bêtes noires" },
-              { key: "explosive", label: "Explosifs" },
-              { key: "tight", label: "Duels serrés" },
-              { key: "never", label: "Jamais vus" },
-            ].map((s) => (
+            {AFF_VIEWS.map((s) => (
               <button
                 key={s.key}
                 onClick={() => setAffView(s.key)}
                 style={{
-                  padding: "8px 4px",
+                  padding: "7px 4px",
                   borderRadius: 6,
                   border: affView === s.key ? "2px solid #001E50" : "1px solid #E1E3E8",
                   background: affView === s.key ? "#E7ECF5" : "#FFFFFF",
                   fontWeight: 600,
                   fontSize: 11.5,
+                  lineHeight: 1.25,
+                  display: "flex",
+                  flexDirection: "column",
+                  alignItems: "center",
+                  gap: 2,
                 }}
               >
+                <span style={{ fontSize: 17 }} aria-hidden="true">
+                  {s.icon}
+                </span>
                 {s.label}
               </button>
             ))}
+          </div>
+
+          <div
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "flex-start",
+              background: "#F4F5F8",
+              border: "1px solid #DDE0E6",
+              borderRadius: 8,
+              padding: "8px 10px",
+              marginBottom: 12,
+            }}
+          >
+            <span style={{ fontSize: 16, lineHeight: 1.2 }} aria-hidden="true">
+              {affView0(affView).icon}
+            </span>
+            <div style={{ fontSize: 11.5, color: "#3A3B41", lineHeight: 1.4 }}>
+              <strong style={{ color: "#001E50" }}>{affView0(affView).label}</strong> —{" "}
+              {affView0(affView).desc}
+            </div>
           </div>
 
           {affList.length === 0 ? (
